@@ -328,6 +328,97 @@ function Get-AdoTestResults {
     return $allResults.ToArray()
 }
 
+function Get-NormalizedAreaPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Project,
+
+        [Parameter(Mandatory)]
+        [string]$AreaPath
+    )
+
+    $normalized = $AreaPath.Trim().Trim('\').Replace('/', '\')
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        throw 'Area Path cannot be empty.'
+    }
+
+    if ($normalized.Equals($Project, [StringComparison]::OrdinalIgnoreCase)) {
+        return $Project
+    }
+
+    if ($normalized.StartsWith("$Project\", [StringComparison]::OrdinalIgnoreCase)) {
+        return $normalized
+    }
+
+    return "$Project\$normalized"
+}
+
+function Get-AdoTestCaseIdsByAreaPath {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$AreaPath
+    )
+
+    $normalizedAreaPath = Get-NormalizedAreaPath -Project $Context.Project -AreaPath $AreaPath
+    $escapedAreaPath = $normalizedAreaPath.Replace("'", "''")
+    $encodedProject = [uri]::EscapeDataString($Context.Project)
+    $query = @"
+SELECT [System.Id]
+FROM WorkItems
+WHERE [System.TeamProject] = @project
+  AND [System.WorkItemType] = 'Test Case'
+  AND [System.AreaPath] UNDER '$escapedAreaPath'
+"@
+
+    Write-Step "Resolving Test Cases under Area Path '$normalizedAreaPath'"
+    $response = Invoke-AdoRestMethod `
+        -Context $Context `
+        -Method POST `
+        -Path "$encodedProject/_apis/wit/wiql?api-version=$($script:ApiVersion)" `
+        -Body @{ query = $query }
+
+    $testCaseIds = [Collections.Generic.HashSet[int]]::new()
+    foreach ($workItem in @($response.workItems)) {
+        $null = $testCaseIds.Add([int]$workItem.id)
+    }
+
+    return [pscustomobject]@{
+        AreaPath    = $normalizedAreaPath
+        TestCaseIds = $testCaseIds
+    }
+}
+
+function Select-AdoResultsByTestCaseIds {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Results,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [Collections.Generic.HashSet[int]]$TestCaseIds
+    )
+
+    return @($Results | Where-Object {
+            $testCase = Get-PropertyValue -Source $_ -Name 'testCase'
+            if (-not $testCase) {
+                return $false
+            }
+
+            $testCaseId = Get-PropertyValue -Source $testCase -Name 'id'
+            if ($null -eq $testCaseId) {
+                return $false
+            }
+
+            $parsedId = 0
+            [int]::TryParse([string]$testCaseId, [ref]$parsedId) -and
+                $TestCaseIds.Contains($parsedId)
+        })
+}
+
 function Export-AdoAttachments {
     param(
         [Parameter(Mandatory)]
@@ -397,12 +488,22 @@ function Export-AdoTestHistory {
         [string]$OutputRoot,
 
         [AllowNull()]
-        [Nullable[datetime]]$MinLastUpdatedDate
+        [Nullable[datetime]]$MinLastUpdatedDate,
+
+        [AllowNull()]
+        [string]$AreaPath
     )
 
     Write-Step 'Querying Test Runs'
     $runs = @(Get-AdoTestRuns -Context $Context -MinLastUpdatedDate $MinLastUpdatedDate)
     Write-Host "$($runs.Count) run(s) found." -ForegroundColor DarkGray
+
+    $areaFilter = $null
+    if (-not [string]::IsNullOrWhiteSpace($AreaPath)) {
+        $areaFilter = Get-AdoTestCaseIdsByAreaPath -Context $Context -AreaPath $AreaPath
+        Write-Host "$($areaFilter.TestCaseIds.Count) Test Case(s) found in the selected Area Path." -ForegroundColor DarkGray
+        Write-Host 'Results without an associated Test Case are excluded when this filter is active.' -ForegroundColor DarkGray
+    }
 
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $safeProject = Get-SafeFileName -Name $Context.Project
@@ -411,20 +512,36 @@ function Export-AdoTestHistory {
     New-Item -ItemType Directory -Path $runsPath -Force | Out-Null
 
     $manifestRuns = [Collections.Generic.List[object]]::new()
+    $skippedRunCount = 0
+    $skippedResultCount = 0
     $current = 0
     foreach ($runSummary in $runs) {
         $current++
-        Write-Step "Exporting run $current/$($runs.Count): ID $($runSummary.id) - $($runSummary.name)"
-
-        $runPath = Join-Path $runsPath ([string]$runSummary.id)
-        New-Item -ItemType Directory -Path $runPath -Force | Out-Null
+        Write-Step "Inspecting run $current/$($runs.Count): ID $($runSummary.id) - $($runSummary.name)"
         $encodedProject = [uri]::EscapeDataString($Context.Project)
         $run = Invoke-AdoRestMethod `
             -Context $Context `
             -Method GET `
             -Path "$encodedProject/_apis/test/runs/$($runSummary.id)?includeDetails=true&api-version=$($script:ApiVersion)"
-        $results = @(Get-AdoTestResults -Context $Context -RunId $runSummary.id)
+        $allResults = @(Get-AdoTestResults -Context $Context -RunId $runSummary.id)
+        $results = $allResults
 
+        if ($areaFilter) {
+            $results = @(Select-AdoResultsByTestCaseIds `
+                    -Results $allResults `
+                    -TestCaseIds $areaFilter.TestCaseIds)
+            $skippedResultCount += $allResults.Count - $results.Count
+
+            if ($results.Count -eq 0) {
+                $skippedRunCount++
+                Write-Host '   Skipped: no results match the selected Area Path.' -ForegroundColor DarkGray
+                continue
+            }
+        }
+
+        Write-Host "   Exporting $($results.Count) result(s)." -ForegroundColor DarkGray
+        $runPath = Join-Path $runsPath ([string]$runSummary.id)
+        New-Item -ItemType Directory -Path $runPath -Force | Out-Null
         Save-JsonFile -Value $run -Path (Join-Path $runPath 'run.json')
         Save-JsonFile -Value ([pscustomobject]@{
                 count = $results.Count
@@ -442,6 +559,7 @@ function Export-AdoTestHistory {
                 name        = $runSummary.name
                 path        = "runs/$($runSummary.id)"
                 resultCount = $results.Count
+                sourceResultCount = $allResults.Count
             })
     }
 
@@ -456,6 +574,9 @@ function Export-AdoTestHistory {
         } else {
             $null
         }
+        areaPath            = if ($areaFilter) { $areaFilter.AreaPath } else { $null }
+        skippedRunCount     = $skippedRunCount
+        skippedResultCount  = $skippedResultCount
         runCount           = $manifestRuns.Count
         runs               = $manifestRuns.ToArray()
     }

@@ -14,6 +14,7 @@ Azure DevOps project and recreates them in another project or organization.
   - Azure CLI authenticated as a user with Azure DevOps access; or
   - A PAT with `Test Management: Read` for export and
     `Test Management: Read & write` for import.
+- Exporting with an Area Path filter also requires `Work Items: Read`.
 
 ## Usage
 
@@ -27,6 +28,12 @@ The menu provides the following operations:
 1. Export Test Run history.
 2. Import a previous export.
 3. Validate access.
+
+The export operation supports optional filters for the last updated date and
+Area Path. The Area Path filter includes child areas and exports only results
+associated with Test Cases under that path. Runs with no matching results are
+skipped. Results without an associated Test Case are also skipped while the
+filter is active.
 
 Use `-Verbose` for additional technical details:
 

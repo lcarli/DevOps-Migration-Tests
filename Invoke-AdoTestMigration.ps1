@@ -83,7 +83,16 @@ function Invoke-ExportMenu {
         $fromDate = $parsedDate
     }
 
-    $exportPath = Export-AdoTestHistory -Context $context -OutputRoot $outputRoot -MinLastUpdatedDate $fromDate
+    $areaPath = Read-Host 'Area Path filter (empty = all, child areas are included)'
+    if ([string]::IsNullOrWhiteSpace($areaPath)) {
+        $areaPath = $null
+    }
+
+    $exportPath = Export-AdoTestHistory `
+        -Context $context `
+        -OutputRoot $outputRoot `
+        -MinLastUpdatedDate $fromDate `
+        -AreaPath $areaPath
     Write-Host ''
     Write-Host "Export completed: $exportPath" -ForegroundColor Green
 }
