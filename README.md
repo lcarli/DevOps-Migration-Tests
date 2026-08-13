@@ -33,7 +33,9 @@ The export operation supports optional filters for the last updated date and
 Area Path. The Area Path filter includes child areas and exports only results
 associated with Test Cases under that path. Runs with no matching results are
 skipped. Results without an associated Test Case are also skipped while the
-filter is active.
+filter is active. Enter the Area Path as displayed in Azure DevOps. The script
+validates it against the project's classification tree and supports projects
+whose current name differs from the Area Path root.
 
 Use `-Verbose` for additional technical details:
 
@@ -63,6 +65,8 @@ new target IDs.
 
 - The operation recreates unplanned runs. It does not automatically map Test
   Plans, Suites, Test Points, or Configurations.
+- Planned manual results are currently recreated as unplanned migrated results
+  until Test Point mapping is available.
 - References to work items, bugs, builds, pipelines, and releases are not
   recreated without an explicit mapping between projects.
 - Operational dates can be submitted, but audit dates and identities are set by

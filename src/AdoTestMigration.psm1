@@ -129,7 +129,24 @@ function Get-AdoErrorMessage {
     }
 
     $statusCode = [int]$response.StatusCode
-    return "Azure DevOps returned HTTP $statusCode. Check the organization, project, and permissions."
+    $serviceMessage = $null
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        try {
+            $errorBody = $ErrorRecord.ErrorDetails.Message | ConvertFrom-Json
+            if ($errorBody.message) {
+                $serviceMessage = [string]$errorBody.message
+            }
+        }
+        catch {
+            $serviceMessage = $ErrorRecord.ErrorDetails.Message.Trim()
+        }
+    }
+
+    $message = "Azure DevOps returned HTTP $statusCode."
+    if (-not [string]::IsNullOrWhiteSpace($serviceMessage)) {
+        $message += " $serviceMessage"
+    }
+    return $message
 }
 
 function Invoke-AdoRestMethod {
@@ -157,7 +174,7 @@ function Invoke-AdoRestMethod {
 
     if ($null -ne $Body) {
         $parameters.ContentType = 'application/json'
-        $parameters.Body = $Body | ConvertTo-Json -Depth 100 -Compress
+        $parameters.Body = ConvertTo-Json -InputObject $Body -Depth 100 -Compress
     }
 
     try {
@@ -328,11 +345,8 @@ function Get-AdoTestResults {
     return $allResults.ToArray()
 }
 
-function Get-NormalizedAreaPath {
+function Get-NormalizedAreaPathValue {
     param(
-        [Parameter(Mandatory)]
-        [string]$Project,
-
         [Parameter(Mandatory)]
         [string]$AreaPath
     )
@@ -342,15 +356,86 @@ function Get-NormalizedAreaPath {
         throw 'Area Path cannot be empty.'
     }
 
-    if ($normalized.Equals($Project, [StringComparison]::OrdinalIgnoreCase)) {
-        return $Project
+    return $normalized
+}
+
+function Get-AdoAreaPaths {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context
+    )
+
+    $encodedProject = [uri]::EscapeDataString($Context.Project)
+    $root = Invoke-AdoRestMethod `
+        -Context $Context `
+        -Method GET `
+        -Path "$encodedProject/_apis/wit/classificationnodes/Areas?`$depth=100&api-version=$($script:ApiVersion)"
+
+    $areaPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $nodes = [Collections.Generic.Stack[object]]::new()
+    $nodes.Push([pscustomobject]@{
+            Node     = $root
+            AreaPath = [string]$root.name
+        })
+
+    while ($nodes.Count -gt 0) {
+        $entry = $nodes.Pop()
+        $node = $entry.Node
+        $null = $areaPaths.Add($entry.AreaPath)
+
+        $children = Get-PropertyValue -Source $node -Name 'children' -DefaultValue @()
+        foreach ($child in @($children)) {
+            $nodes.Push([pscustomobject]@{
+                    Node     = $child
+                    AreaPath = "$($entry.AreaPath)\$($child.name)"
+                })
+        }
     }
 
-    if ($normalized.StartsWith("$Project\", [StringComparison]::OrdinalIgnoreCase)) {
-        return $normalized
+    return ,$areaPaths
+}
+
+function Resolve-AdoAreaPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Project,
+
+        [Parameter(Mandatory)]
+        [string]$AreaPath,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [Collections.Generic.HashSet[string]]$AvailableAreaPaths
+    )
+
+    $requestedPath = Get-NormalizedAreaPathValue -AreaPath $AreaPath
+    if ($AvailableAreaPaths.Contains($requestedPath)) {
+        return $requestedPath
     }
 
-    return "$Project\$normalized"
+    $projectRelativePath = "$Project\$requestedPath"
+    if ($AvailableAreaPaths.Contains($projectRelativePath)) {
+        return $projectRelativePath
+    }
+
+    $suffix = "\$requestedPath"
+    $suffixMatches = @($AvailableAreaPaths | Where-Object {
+            $_.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase)
+        })
+    if ($suffixMatches.Count -eq 1) {
+        return $suffixMatches[0]
+    }
+    if ($suffixMatches.Count -gt 1) {
+        throw "Area Path '$AreaPath' is ambiguous. Enter its complete path as shown in Azure DevOps."
+    }
+
+    $availableExamples = @($AvailableAreaPaths | Sort-Object | Select-Object -First 5)
+    $exampleText = if ($availableExamples.Count -gt 0) {
+        " Available paths include: $($availableExamples -join '; ')."
+    } else {
+        ''
+    }
+    throw "Area Path '$AreaPath' was not found in project '$Project'.$exampleText"
 }
 
 function Get-AdoTestCaseIdsByAreaPath {
@@ -362,8 +447,13 @@ function Get-AdoTestCaseIdsByAreaPath {
         [string]$AreaPath
     )
 
-    $normalizedAreaPath = Get-NormalizedAreaPath -Project $Context.Project -AreaPath $AreaPath
-    $escapedAreaPath = $normalizedAreaPath.Replace("'", "''")
+    Write-Step "Resolving Area Path '$AreaPath'"
+    $availableAreaPaths = Get-AdoAreaPaths -Context $Context
+    $resolvedAreaPath = Resolve-AdoAreaPath `
+        -Project $Context.Project `
+        -AreaPath $AreaPath `
+        -AvailableAreaPaths $availableAreaPaths
+    $escapedAreaPath = $resolvedAreaPath.Replace("'", "''")
     $encodedProject = [uri]::EscapeDataString($Context.Project)
     $query = @"
 SELECT [System.Id]
@@ -373,7 +463,7 @@ WHERE [System.TeamProject] = @project
   AND [System.AreaPath] UNDER '$escapedAreaPath'
 "@
 
-    Write-Step "Resolving Test Cases under Area Path '$normalizedAreaPath'"
+    Write-Step "Resolving Test Cases under Area Path '$resolvedAreaPath'"
     $response = Invoke-AdoRestMethod `
         -Context $Context `
         -Method POST `
@@ -386,7 +476,7 @@ WHERE [System.TeamProject] = @project
     }
 
     return [pscustomobject]@{
-        AreaPath    = $normalizedAreaPath
+        AreaPath    = $resolvedAreaPath
         TestCaseIds = $testCaseIds
     }
 }
@@ -497,6 +587,9 @@ function Export-AdoTestHistory {
     Write-Step 'Querying Test Runs'
     $runs = @(Get-AdoTestRuns -Context $Context -MinLastUpdatedDate $MinLastUpdatedDate)
     Write-Host "$($runs.Count) run(s) found." -ForegroundColor DarkGray
+    if ($runs.Count -eq 0 -and $null -ne $MinLastUpdatedDate) {
+        Write-Warning "No Test Runs matched the date filter starting at $($MinLastUpdatedDate.ToString('yyyy-MM-dd'))."
+    }
 
     $areaFilter = $null
     if (-not [string]::IsNullOrWhiteSpace($AreaPath)) {
@@ -626,14 +719,17 @@ function Get-PropertyValue {
 function New-RunCreatePayload {
     param(
         [Parameter(Mandatory)]
-        [object]$Run
+        [object]$Run,
+
+        [switch]$ForceAutomated
     )
 
     $payload = @{
         name      = $Run.name
         state     = 'InProgress'
         comment   = "Recreated from Azure DevOps Test Run ID $($Run.id)."
-        automated = [bool](Get-PropertyValue -Source $Run -Name 'isAutomated' -DefaultValue $false)
+        automated = $ForceAutomated.IsPresent -or
+            [bool](Get-PropertyValue -Source $Run -Name 'isAutomated' -DefaultValue $false)
     }
     Add-PropertyIfPresent -Target $payload -Source $Run -SourceName 'startDate'
     return $payload
@@ -672,6 +768,11 @@ function New-ResultCreatePayload {
             'resolutionState'
         )) {
         Add-PropertyIfPresent -Target $payload -Source $Result -SourceName $propertyName
+    }
+
+    if (-not $payload.ContainsKey('automatedTestName')) {
+        $payload.automatedTestName = "MigratedTestResult.$($Result.id)"
+        $payload.automatedTestType = 'Migrated'
     }
 
     return $payload
@@ -783,12 +884,17 @@ function Import-AdoTestHistory {
         $sourceRun = Get-Content -LiteralPath (Join-Path $runPath 'run.json') -Raw | ConvertFrom-Json
         $resultDocument = Get-Content -LiteralPath (Join-Path $runPath 'results.json') -Raw | ConvertFrom-Json
         $sourceResults = @($resultDocument.value)
+        $requiresAutomatedImport = @($sourceResults | Where-Object {
+                [string]::IsNullOrWhiteSpace(
+                    [string](Get-PropertyValue -Source $_ -Name 'automatedTestName')
+                )
+            }).Count -gt 0
 
         $newRun = Invoke-AdoRestMethod `
             -Context $Context `
             -Method POST `
             -Path "$encodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
-            -Body (New-RunCreatePayload -Run $sourceRun)
+            -Body (New-RunCreatePayload -Run $sourceRun -ForceAutomated:$requiresAutomatedImport)
 
         $resultMap = [Collections.Generic.List[object]]::new()
         for ($offset = 0; $offset -lt $sourceResults.Count; $offset += 200) {

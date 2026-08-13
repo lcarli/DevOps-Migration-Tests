@@ -51,6 +51,7 @@ function New-InteractiveContext {
 
     if ($authenticationMethod -eq 'Pat') {
         Write-Host "The PAT requires Test Management $AccessLevel access." -ForegroundColor DarkGray
+        Write-Host 'Area Path filtering also requires Work Items Read access.' -ForegroundColor DarkGray
         $contextParameters.Pat = Read-Host 'PAT (it will not be saved)' -AsSecureString
     }
 
@@ -83,7 +84,7 @@ function Invoke-ExportMenu {
         $fromDate = $parsedDate
     }
 
-    $areaPath = Read-Host 'Area Path filter (empty = all, child areas are included)'
+    $areaPath = Read-Host 'Area Path as shown in Azure DevOps (empty = all, child areas are included)'
     if ([string]::IsNullOrWhiteSpace($areaPath)) {
         $areaPath = $null
     }
