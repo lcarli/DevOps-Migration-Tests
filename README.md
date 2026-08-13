@@ -37,6 +37,10 @@ filter is active. Enter the Area Path as displayed in Azure DevOps. The script
 validates it against the project's classification tree and supports projects
 whose current name differs from the Area Path root.
 
+The date filter is applied locally to the `lastUpdatedDate` returned for each
+run, starting at midnight UTC on the selected date. It does not filter by the
+run start or completion date.
+
 Use `-Verbose` for additional technical details:
 
 ```powershell

@@ -283,6 +283,37 @@ function Get-CollectionValue {
     return @($Response)
 }
 
+function Select-AdoRunsByLastUpdatedDate {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Runs,
+
+        [AllowNull()]
+        [Nullable[datetime]]$MinLastUpdatedDate
+    )
+
+    if ($null -eq $MinLastUpdatedDate) {
+        return $Runs
+    }
+
+    $minimumDate = [DateTimeOffset]$MinLastUpdatedDate.ToUniversalTime()
+    return @($Runs | Where-Object {
+            $lastUpdatedDate = Get-PropertyValue -Source $_ -Name 'lastUpdatedDate'
+            if ([string]::IsNullOrWhiteSpace([string]$lastUpdatedDate)) {
+                return $false
+            }
+
+            $parsedDate = [DateTimeOffset]::MinValue
+            [DateTimeOffset]::TryParse(
+                [string]$lastUpdatedDate,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::AssumeUniversal,
+                [ref]$parsedDate
+            ) -and $parsedDate.ToUniversalTime() -ge $minimumDate
+        })
+}
+
 function Get-AdoTestRuns {
     param(
         [Parameter(Mandatory)]
@@ -299,21 +330,34 @@ function Get-AdoTestRuns {
 
     do {
         $path = "$encodedProject/_apis/test/runs?includeRunDetails=true&`$skip=$skip&`$top=$pageSize"
-        if ($null -ne $MinLastUpdatedDate) {
-            $dateValue = [uri]::EscapeDataString($MinLastUpdatedDate.ToUniversalTime().ToString('o'))
-            $path += "&minLastUpdatedDate=$dateValue"
-        }
         $path += "&api-version=$($script:ApiVersion)"
 
         $response = Invoke-AdoRestMethod -Context $Context -Method GET -Path $path
         $page = @(Get-CollectionValue -Response $response)
         foreach ($run in $page) {
-            $allRuns.Add($run)
+            if ([string]$run.state -ne '255') {
+                $allRuns.Add($run)
+            }
         }
         $skip += $page.Count
     } while ($page.Count -eq $pageSize)
 
-    return $allRuns.ToArray()
+    if ($null -eq $MinLastUpdatedDate) {
+        return $allRuns.ToArray()
+    }
+
+    $detailedRuns = [Collections.Generic.List[object]]::new()
+    foreach ($run in $allRuns) {
+        $details = Invoke-AdoRestMethod `
+            -Context $Context `
+            -Method GET `
+            -Path "$encodedProject/_apis/test/runs/$($run.id)?includeDetails=true&api-version=$($script:ApiVersion)"
+        $detailedRuns.Add($details)
+    }
+
+    return @(Select-AdoRunsByLastUpdatedDate `
+            -Runs $detailedRuns.ToArray() `
+            -MinLastUpdatedDate $MinLastUpdatedDate)
 }
 
 function Get-AdoTestResults {
@@ -612,10 +656,14 @@ function Export-AdoTestHistory {
         $current++
         Write-Step "Inspecting run $current/$($runs.Count): ID $($runSummary.id) - $($runSummary.name)"
         $encodedProject = [uri]::EscapeDataString($Context.Project)
-        $run = Invoke-AdoRestMethod `
-            -Context $Context `
-            -Method GET `
-            -Path "$encodedProject/_apis/test/runs/$($runSummary.id)?includeDetails=true&api-version=$($script:ApiVersion)"
+        $run = if (Get-PropertyValue -Source $runSummary -Name 'lastUpdatedDate') {
+            $runSummary
+        } else {
+            Invoke-AdoRestMethod `
+                -Context $Context `
+                -Method GET `
+                -Path "$encodedProject/_apis/test/runs/$($runSummary.id)?includeDetails=true&api-version=$($script:ApiVersion)"
+        }
         $allResults = @(Get-AdoTestResults -Context $Context -RunId $runSummary.id)
         $results = $allResults
 

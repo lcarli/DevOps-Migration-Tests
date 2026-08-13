@@ -76,7 +76,8 @@ function Invoke-ExportMenu {
                 $fromDateText,
                 'yyyy-MM-dd',
                 [Globalization.CultureInfo]::InvariantCulture,
-                [Globalization.DateTimeStyles]::AssumeUniversal,
+                [Globalization.DateTimeStyles]::AssumeUniversal -bor
+                    [Globalization.DateTimeStyles]::AdjustToUniversal,
                 [ref]$parsedDate
             )) {
             throw "Invalid date: '$fromDateText'. Use the YYYY-MM-DD format."
