@@ -47,6 +47,18 @@ Use `-Verbose` for additional technical details:
 .\Invoke-AdoTestMigration.ps1 -Verbose
 ```
 
+Every execution also creates a timestamped diagnostic log under `logs`. The log
+records REST request URLs without credentials, request durations, the current
+run ID, processing phase, filters, skipped runs, and complete error context.
+PAT values and authorization headers are never written to the log.
+
+Export and import operations also generate JSON and CSV reports with one row
+per run. Export statuses include `Exported`, `SkippedNoTestCaseLink`,
+`SkippedOutsideAreaPath`, `SkippedAreaPath`, and `Unavailable`. The report
+separately counts results without a Test Case link and results linked to Test
+Cases outside the selected Area Path. Import statuses include `Imported`,
+`Failed`, `FailedPartial`, and `NotAttempted`.
+
 ## Export contents
 
 Each export creates a directory under `exports`:
@@ -64,6 +76,10 @@ exports/
 
 After import, a `migration-map-*.json` file records the source IDs and their
 new target IDs.
+
+The export manifest records runs skipped because they were deleted or became
+unavailable after the initial run listing. A `404` for one of these runs does
+not stop the remaining export.
 
 ## Limitations
 

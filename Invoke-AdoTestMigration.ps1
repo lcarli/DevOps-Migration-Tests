@@ -6,6 +6,8 @@ param()
 $ErrorActionPreference = 'Stop'
 $modulePath = Join-Path $PSScriptRoot 'src\AdoTestMigration.psm1'
 Import-Module $modulePath -Force
+$logPath = Join-Path $PSScriptRoot "logs\ado-test-migration-$((Get-Date).ToString('yyyyMMdd-HHmmss')).log"
+Initialize-AdoLogging -Path $logPath
 
 function Read-RequiredValue {
     param(
@@ -128,29 +130,45 @@ function Invoke-ValidationMenu {
 Write-Host ''
 Write-Host 'Azure DevOps Test History Migration' -ForegroundColor Cyan
 Write-Host 'Exports and recreates Test Runs through the official REST APIs.' -ForegroundColor DarkGray
+Write-Host "Detailed log: $logPath" -ForegroundColor DarkGray
 
-do {
-    Write-Host ''
-    Write-Host 'Main menu' -ForegroundColor Cyan
-    Write-Host '  1. Export Test Run history'
-    Write-Host '  2. Import exported history'
-    Write-Host '  3. Validate access'
-    Write-Host '  0. Exit'
-
-    $choice = Read-Host 'Choose an option'
-
-    try {
-        switch ($choice) {
-            '1' { Invoke-ExportMenu }
-            '2' { Invoke-ImportMenu }
-            '3' { Invoke-ValidationMenu }
-            '0' { Write-Host 'Exiting.' }
-            default { Write-Host 'Invalid option.' -ForegroundColor Yellow }
-        }
-    }
-    catch {
+try {
+    do {
         Write-Host ''
-        Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Verbose $_.ScriptStackTrace
-    }
-} while ($choice -ne '0')
+        Write-Host 'Main menu' -ForegroundColor Cyan
+        Write-Host '  1. Export Test Run history'
+        Write-Host '  2. Import exported history'
+        Write-Host '  3. Validate access'
+        Write-Host '  0. Exit'
+
+        $choice = Read-Host 'Choose an option'
+        Write-AdoLog -Level Info -Message 'Menu option selected.' -Context @{ option = $choice }
+
+        try {
+            switch ($choice) {
+                '1' { Invoke-ExportMenu }
+                '2' { Invoke-ImportMenu }
+                '3' { Invoke-ValidationMenu }
+                '0' { Write-Host 'Exiting.' }
+                default { Write-Host 'Invalid option.' -ForegroundColor Yellow }
+            }
+        }
+        catch {
+            Write-AdoLog `
+                -Level Error `
+                -Message 'Menu operation failed.' `
+                -Context @{
+                    option     = $choice
+                    error      = $_.Exception.Message
+                    stackTrace = $_.ScriptStackTrace
+                }
+            Write-Host ''
+            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "See the detailed log: $logPath" -ForegroundColor DarkGray
+            Write-Verbose $_.ScriptStackTrace
+        }
+    } while ($choice -ne '0')
+}
+finally {
+    Write-AdoLog -Level Info -Message 'Application stopped.'
+}

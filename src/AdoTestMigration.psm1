@@ -1,6 +1,51 @@
 Set-StrictMode -Version Latest
 $script:ApiVersion = '7.1'
 $script:AzureDevOpsResourceId = '499b84ac-1321-427f-aa17-267ca6975798'
+$script:LogPath = $null
+
+function Initialize-AdoLogging {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $parentPath = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Path $parentPath -Force | Out-Null
+    $script:LogPath = [IO.Path]::GetFullPath($Path)
+    Set-Content `
+        -LiteralPath $script:LogPath `
+        -Encoding utf8NoBOM `
+        -Value "$(Get-Date -Format 'o') [INFO] Logging initialized."
+}
+
+function Write-AdoLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Debug', 'Info', 'Warning', 'Error')]
+        [string]$Level,
+
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [hashtable]$Context
+    )
+
+    if ([string]::IsNullOrWhiteSpace($script:LogPath)) {
+        return
+    }
+
+    $contextText = ''
+    if ($Context -and $Context.Count -gt 0) {
+        $contextText = ' ' + (ConvertTo-Json -InputObject $Context -Depth 20 -Compress)
+    }
+
+    Add-Content `
+        -LiteralPath $script:LogPath `
+        -Encoding utf8NoBOM `
+        -Value "$(Get-Date -Format 'o') [$($Level.ToUpperInvariant())] $Message$contextText"
+}
 
 function Write-Step {
     param(
@@ -8,6 +53,7 @@ function Write-Step {
         [string]$Message
     )
 
+    Write-AdoLog -Level Info -Message $Message
     Write-Host ">> $Message" -ForegroundColor Cyan
 }
 
@@ -149,6 +195,43 @@ function Get-AdoErrorMessage {
     return $message
 }
 
+function New-AdoRestException {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+
+        [Parameter(Mandatory)]
+        [string]$Method,
+
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    $message = Get-AdoErrorMessage -ErrorRecord $ErrorRecord
+    $exception = [InvalidOperationException]::new($message, $ErrorRecord.Exception)
+    $exception.Data['Method'] = $Method
+    $exception.Data['Uri'] = $Uri
+
+    if ($ErrorRecord.Exception.Response) {
+        $exception.Data['StatusCode'] = [int]$ErrorRecord.Exception.Response.StatusCode
+    }
+
+    return $exception
+}
+
+function Test-AdoHttpStatus {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+
+        [Parameter(Mandatory)]
+        [int]$StatusCode
+    )
+
+    return $ErrorRecord.Exception.Data.Contains('StatusCode') -and
+        [int]$ErrorRecord.Exception.Data['StatusCode'] -eq $StatusCode
+}
+
 function Invoke-AdoRestMethod {
     param(
         [Parameter(Mandatory)]
@@ -177,11 +260,39 @@ function Invoke-AdoRestMethod {
         $parameters.Body = ConvertTo-Json -InputObject $Body -Depth 100 -Compress
     }
 
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    Write-AdoLog `
+        -Level Debug `
+        -Message 'Azure DevOps REST request started.' `
+        -Context @{ method = $Method; uri = $uri }
+
     try {
-        return Invoke-RestMethod @parameters
+        $response = Invoke-RestMethod @parameters
+        $stopwatch.Stop()
+        Write-AdoLog `
+            -Level Debug `
+            -Message 'Azure DevOps REST request completed.' `
+            -Context @{
+                method     = $Method
+                uri        = $uri
+                durationMs = $stopwatch.ElapsedMilliseconds
+            }
+        return $response
     }
     catch {
-        throw (Get-AdoErrorMessage -ErrorRecord $_)
+        $stopwatch.Stop()
+        $exception = New-AdoRestException -ErrorRecord $_ -Method $Method -Uri $uri
+        Write-AdoLog `
+            -Level Error `
+            -Message 'Azure DevOps REST request failed.' `
+            -Context @{
+                method     = $Method
+                uri        = $uri
+                statusCode = $exception.Data['StatusCode']
+                durationMs = $stopwatch.ElapsedMilliseconds
+                error      = $exception.Message
+            }
+        throw $exception
     }
 }
 
@@ -198,14 +309,30 @@ function Save-AdoBinary {
     )
 
     try {
+        Write-AdoLog `
+            -Level Debug `
+            -Message 'Attachment download started.' `
+            -Context @{ uri = "$($Context.OrganizationUrl)/$Path"; destination = $Destination }
         Invoke-WebRequest `
             -Uri "$($Context.OrganizationUrl)/$Path" `
             -Headers $Context.Headers `
             -OutFile $Destination `
             -ErrorAction Stop | Out-Null
+        Write-AdoLog `
+            -Level Debug `
+            -Message 'Attachment download completed.' `
+            -Context @{ destination = $Destination }
     }
     catch {
-        throw (Get-AdoErrorMessage -ErrorRecord $_)
+        $exception = New-AdoRestException `
+            -ErrorRecord $_ `
+            -Method GET `
+            -Uri "$($Context.OrganizationUrl)/$Path"
+        Write-AdoLog `
+            -Level Error `
+            -Message 'Attachment download failed.' `
+            -Context @{ destination = $Destination; error = $exception.Message }
+        throw $exception
     }
 }
 
@@ -252,6 +379,54 @@ function Save-JsonFile {
     $Value |
         ConvertTo-Json -Depth 100 |
         Set-Content -LiteralPath $Path -Encoding utf8NoBOM
+}
+
+function Save-AdoRunReport {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Entries,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Summary,
+
+        [Parameter(Mandatory)]
+        [string]$JsonPath,
+
+        [Parameter(Mandatory)]
+        [string]$CsvPath
+    )
+
+    Save-JsonFile `
+        -Value ([ordered]@{
+                generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+                summary        = $Summary
+                runs           = $Entries
+            }) `
+        -Path $JsonPath
+
+    $columns = @(
+        'operation',
+        'status',
+        'sourceRunId',
+        'targetRunId',
+        'name',
+        'sourceResultCount',
+        'processedResultCount',
+        'unlinkedResultCount',
+        'outsideAreaResultCount',
+        'reason'
+    )
+    if ($Entries.Count -gt 0) {
+        $Entries |
+            Select-Object -Property $columns |
+            Export-Csv -LiteralPath $CsvPath -NoTypeInformation -Encoding utf8
+    }
+    else {
+        Set-Content `
+            -LiteralPath $CsvPath `
+            -Encoding utf8NoBOM `
+            -Value ($columns -join ',')
+    }
 }
 
 function Get-SafeFileName {
@@ -525,7 +700,7 @@ WHERE [System.TeamProject] = @project
     }
 }
 
-function Select-AdoResultsByTestCaseIds {
+function Get-AdoAreaPathResultSelection {
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
@@ -536,21 +711,36 @@ function Select-AdoResultsByTestCaseIds {
         [Collections.Generic.HashSet[int]]$TestCaseIds
     )
 
-    return @($Results | Where-Object {
-            $testCase = Get-PropertyValue -Source $_ -Name 'testCase'
-            if (-not $testCase) {
-                return $false
-            }
+    $matched = [Collections.Generic.List[object]]::new()
+    $unlinked = [Collections.Generic.List[object]]::new()
+    $outsideArea = [Collections.Generic.List[object]]::new()
 
-            $testCaseId = Get-PropertyValue -Source $testCase -Name 'id'
-            if ($null -eq $testCaseId) {
-                return $false
-            }
+    foreach ($result in $Results) {
+        $testCase = Get-PropertyValue -Source $result -Name 'testCase'
+        $testCaseId = if ($testCase) {
+            Get-PropertyValue -Source $testCase -Name 'id'
+        } else {
+            $null
+        }
 
-            $parsedId = 0
-            [int]::TryParse([string]$testCaseId, [ref]$parsedId) -and
-                $TestCaseIds.Contains($parsedId)
-        })
+        $parsedId = 0
+        if ($null -eq $testCaseId -or
+            -not [int]::TryParse([string]$testCaseId, [ref]$parsedId)) {
+            $unlinked.Add($result)
+        }
+        elseif ($TestCaseIds.Contains($parsedId)) {
+            $matched.Add($result)
+        }
+        else {
+            $outsideArea.Add($result)
+        }
+    }
+
+    return [pscustomobject]@{
+        Matched     = $matched.ToArray()
+        Unlinked    = $unlinked.ToArray()
+        OutsideArea = $outsideArea.ToArray()
+    }
 }
 
 function Export-AdoAttachments {
@@ -629,8 +819,23 @@ function Export-AdoTestHistory {
     )
 
     Write-Step 'Querying Test Runs'
+    Write-AdoLog `
+        -Level Info `
+        -Message 'Export parameters resolved.' `
+        -Context @{
+            organization       = $Context.OrganizationUrl
+            project            = $Context.Project
+            outputRoot         = $OutputRoot
+            minLastUpdatedDate = if ($null -ne $MinLastUpdatedDate) {
+                $MinLastUpdatedDate.ToUniversalTime().ToString('o')
+            } else {
+                $null
+            }
+            requestedAreaPath  = $AreaPath
+        }
     $runs = @(Get-AdoTestRuns -Context $Context -MinLastUpdatedDate $MinLastUpdatedDate)
     Write-Host "$($runs.Count) run(s) found." -ForegroundColor DarkGray
+    Write-AdoLog -Level Info -Message 'Candidate Test Runs loaded.' -Context @{ count = $runs.Count }
     if ($runs.Count -eq 0 -and $null -ne $MinLastUpdatedDate) {
         Write-Warning "No Test Runs matched the date filter starting at $($MinLastUpdatedDate.ToString('yyyy-MM-dd'))."
     }
@@ -649,59 +854,219 @@ function Export-AdoTestHistory {
     New-Item -ItemType Directory -Path $runsPath -Force | Out-Null
 
     $manifestRuns = [Collections.Generic.List[object]]::new()
+    $unavailableRuns = [Collections.Generic.List[object]]::new()
+    $reportEntries = [Collections.Generic.List[object]]::new()
     $skippedRunCount = 0
     $skippedResultCount = 0
+    $unlinkedRunCount = 0
+    $outsideAreaRunCount = 0
     $current = 0
     foreach ($runSummary in $runs) {
         $current++
         Write-Step "Inspecting run $current/$($runs.Count): ID $($runSummary.id) - $($runSummary.name)"
         $encodedProject = [uri]::EscapeDataString($Context.Project)
-        $run = if (Get-PropertyValue -Source $runSummary -Name 'lastUpdatedDate') {
-            $runSummary
-        } else {
-            Invoke-AdoRestMethod `
+        $runPath = Join-Path $runsPath ([string]$runSummary.id)
+
+        try {
+            Write-AdoLog `
+                -Level Debug `
+                -Message 'Run processing started.' `
+                -Context @{
+                    index   = $current
+                    total   = $runs.Count
+                    runId   = $runSummary.id
+                    runName = $runSummary.name
+                    phase   = 'details'
+                }
+            $run = if (Get-PropertyValue -Source $runSummary -Name 'lastUpdatedDate') {
+                $runSummary
+            } else {
+                Invoke-AdoRestMethod `
+                    -Context $Context `
+                    -Method GET `
+                    -Path "$encodedProject/_apis/test/runs/$($runSummary.id)?includeDetails=true&api-version=$($script:ApiVersion)"
+            }
+
+            Write-AdoLog `
+                -Level Debug `
+                -Message 'Loading run results.' `
+                -Context @{ runId = $runSummary.id; phase = 'results' }
+            $allResults = @(Get-AdoTestResults -Context $Context -RunId $runSummary.id)
+            $results = $allResults
+
+            if ($areaFilter) {
+                Write-AdoLog `
+                    -Level Debug `
+                    -Message 'Applying Area Path result filter.' `
+                    -Context @{
+                        runId             = $runSummary.id
+                        sourceResultCount = $allResults.Count
+                        areaPath          = $areaFilter.AreaPath
+                        phase             = 'area-filter'
+                    }
+                $selection = Get-AdoAreaPathResultSelection `
+                        -Results $allResults `
+                        -TestCaseIds $areaFilter.TestCaseIds
+                $results = @($selection.Matched)
+                $unlinkedResultCount = @($selection.Unlinked).Count
+                $outsideAreaResultCount = @($selection.OutsideArea).Count
+                $skippedResultCount += $allResults.Count - $results.Count
+
+                if ($results.Count -eq 0) {
+                    $skippedRunCount++
+                    $status = if ($unlinkedResultCount -eq $allResults.Count) {
+                        $unlinkedRunCount++
+                        'SkippedNoTestCaseLink'
+                    }
+                    elseif ($outsideAreaResultCount -eq $allResults.Count) {
+                        $outsideAreaRunCount++
+                        'SkippedOutsideAreaPath'
+                    }
+                    else {
+                        'SkippedAreaPath'
+                    }
+                    $reason = "No results matched Area Path '$($areaFilter.AreaPath)'. " +
+                        "Total: $($allResults.Count); without Test Case link: $unlinkedResultCount; " +
+                        "linked to Test Cases outside the area: $outsideAreaResultCount."
+                    $reportEntries.Add([pscustomobject]@{
+                            operation            = 'Export'
+                            status               = $status
+                            sourceRunId          = $runSummary.id
+                            targetRunId          = $null
+                            name                 = $runSummary.name
+                            sourceResultCount    = $allResults.Count
+                            processedResultCount = 0
+                            unlinkedResultCount   = $unlinkedResultCount
+                            outsideAreaResultCount = $outsideAreaResultCount
+                            reason               = $reason
+                        })
+                    Write-AdoLog `
+                        -Level Info `
+                        -Message 'Run skipped by Area Path classification.' `
+                        -Context @{
+                            runId                  = $runSummary.id
+                            status                 = $status
+                            sourceResultCount      = $allResults.Count
+                            unlinkedResultCount    = $unlinkedResultCount
+                            outsideAreaResultCount = $outsideAreaResultCount
+                        }
+                    if ($status -eq 'SkippedNoTestCaseLink') {
+                        Write-Host "   Skipped: all $unlinkedResultCount result(s) have no Test Case link, so their Area Path cannot be determined." -ForegroundColor Yellow
+                    }
+                    elseif ($status -eq 'SkippedOutsideAreaPath') {
+                        Write-Host "   Skipped: all $outsideAreaResultCount result(s) are linked to Test Cases outside '$($areaFilter.AreaPath)'." -ForegroundColor DarkGray
+                    }
+                    else {
+                        Write-Host "   Skipped: no results matched '$($areaFilter.AreaPath)' ($unlinkedResultCount unlinked, $outsideAreaResultCount outside the area)." -ForegroundColor DarkGray
+                    }
+                    continue
+                }
+
+                if ($unlinkedResultCount -gt 0 -or $outsideAreaResultCount -gt 0) {
+                    Write-Host "   Area filter excluded $($unlinkedResultCount + $outsideAreaResultCount) result(s): $unlinkedResultCount without Test Case link, $outsideAreaResultCount outside the area." -ForegroundColor DarkGray
+                }
+            }
+            else {
+                $unlinkedResultCount = 0
+                $outsideAreaResultCount = 0
+            }
+
+            Write-Host "   Exporting $($results.Count) result(s)." -ForegroundColor DarkGray
+            Write-AdoLog `
+                -Level Debug `
+                -Message 'Writing run data.' `
+                -Context @{ runId = $runSummary.id; resultCount = $results.Count; phase = 'files' }
+            New-Item -ItemType Directory -Path $runPath -Force | Out-Null
+            Save-JsonFile -Value $run -Path (Join-Path $runPath 'run.json')
+            Save-JsonFile -Value ([pscustomobject]@{
+                    count = $results.Count
+                    value = $results
+                }) -Path (Join-Path $runPath 'results.json')
+
+            Write-AdoLog `
+                -Level Debug `
+                -Message 'Exporting run attachments.' `
+                -Context @{ runId = $runSummary.id; phase = 'attachments' }
+            Export-AdoAttachments `
                 -Context $Context `
-                -Method GET `
-                -Path "$encodedProject/_apis/test/runs/$($runSummary.id)?includeDetails=true&api-version=$($script:ApiVersion)"
+                -RunId $runSummary.id `
+                -RunPath $runPath `
+                -Results $results
+
+            $manifestRuns.Add([pscustomobject]@{
+                    sourceRunId      = $runSummary.id
+                    name             = $runSummary.name
+                    path             = "runs/$($runSummary.id)"
+                    resultCount      = $results.Count
+                    sourceResultCount = $allResults.Count
+                })
+            $reportEntries.Add([pscustomobject]@{
+                    operation            = 'Export'
+                    status               = 'Exported'
+                    sourceRunId          = $runSummary.id
+                    targetRunId          = $null
+                    name                 = $runSummary.name
+                    sourceResultCount    = $allResults.Count
+                    processedResultCount = $results.Count
+                    unlinkedResultCount   = $unlinkedResultCount
+                    outsideAreaResultCount = $outsideAreaResultCount
+                    reason               = if ($unlinkedResultCount -gt 0 -or $outsideAreaResultCount -gt 0) {
+                        "Exported matching results only. Excluded $unlinkedResultCount without Test Case link and $outsideAreaResultCount outside the selected Area Path."
+                    } else {
+                        $null
+                    }
+                })
+            Write-AdoLog `
+                -Level Info `
+                -Message 'Run exported successfully.' `
+                -Context @{ runId = $runSummary.id; resultCount = $results.Count }
         }
-        $allResults = @(Get-AdoTestResults -Context $Context -RunId $runSummary.id)
-        $results = $allResults
+        catch {
+            if (Test-AdoHttpStatus -ErrorRecord $_ -StatusCode 404) {
+                if (Test-Path -LiteralPath $runPath -PathType Container) {
+                    Remove-Item -LiteralPath $runPath -Recurse -Force
+                }
 
-        if ($areaFilter) {
-            $results = @(Select-AdoResultsByTestCaseIds `
-                    -Results $allResults `
-                    -TestCaseIds $areaFilter.TestCaseIds)
-            $skippedResultCount += $allResults.Count - $results.Count
-
-            if ($results.Count -eq 0) {
-                $skippedRunCount++
-                Write-Host '   Skipped: no results match the selected Area Path.' -ForegroundColor DarkGray
+                $unavailableRuns.Add([pscustomobject]@{
+                        sourceRunId = $runSummary.id
+                        name        = $runSummary.name
+                        reason      = $_.Exception.Message
+                    })
+                $reportEntries.Add([pscustomobject]@{
+                        operation            = 'Export'
+                        status               = 'Unavailable'
+                        sourceRunId          = $runSummary.id
+                        targetRunId          = $null
+                        name                 = $runSummary.name
+                        sourceResultCount    = $null
+                        processedResultCount = 0
+                        unlinkedResultCount   = $null
+                        outsideAreaResultCount = $null
+                        reason               = $_.Exception.Message
+                    })
+                Write-AdoLog `
+                    -Level Warning `
+                    -Message 'Run became unavailable and was skipped.' `
+                    -Context @{
+                        runId   = $runSummary.id
+                        runName = $runSummary.name
+                        error   = $_.Exception.Message
+                    }
+                Write-Warning "Run ID $($runSummary.id) is no longer available and was skipped."
                 continue
             }
+
+            Write-AdoLog `
+                -Level Error `
+                -Message 'Run processing failed and export was stopped.' `
+                -Context @{
+                    runId      = $runSummary.id
+                    runName    = $runSummary.name
+                    error      = $_.Exception.Message
+                    stackTrace = $_.ScriptStackTrace
+                }
+            throw
         }
-
-        Write-Host "   Exporting $($results.Count) result(s)." -ForegroundColor DarkGray
-        $runPath = Join-Path $runsPath ([string]$runSummary.id)
-        New-Item -ItemType Directory -Path $runPath -Force | Out-Null
-        Save-JsonFile -Value $run -Path (Join-Path $runPath 'run.json')
-        Save-JsonFile -Value ([pscustomobject]@{
-                count = $results.Count
-                value = $results
-            }) -Path (Join-Path $runPath 'results.json')
-
-        Export-AdoAttachments `
-            -Context $Context `
-            -RunId $runSummary.id `
-            -RunPath $runPath `
-            -Results $results
-
-        $manifestRuns.Add([pscustomobject]@{
-                sourceRunId = $runSummary.id
-                name        = $runSummary.name
-                path        = "runs/$($runSummary.id)"
-                resultCount = $results.Count
-                sourceResultCount = $allResults.Count
-            })
     }
 
     $manifest = [ordered]@{
@@ -718,10 +1083,52 @@ function Export-AdoTestHistory {
         areaPath            = if ($areaFilter) { $areaFilter.AreaPath } else { $null }
         skippedRunCount     = $skippedRunCount
         skippedResultCount  = $skippedResultCount
+        unavailableRunCount = $unavailableRuns.Count
+        unavailableRuns     = $unavailableRuns.ToArray()
         runCount           = $manifestRuns.Count
         runs               = $manifestRuns.ToArray()
     }
     Save-JsonFile -Value $manifest -Path (Join-Path $exportPath 'manifest.json')
+    $exportReportJsonPath = Join-Path $exportPath 'export-report.json'
+    $exportReportCsvPath = Join-Path $exportPath 'export-report.csv'
+    $exportedReportEntries = @($reportEntries | Where-Object status -eq 'Exported')
+    $exportedResultCount = if ($exportedReportEntries.Count -gt 0) {
+        [int]($exportedReportEntries |
+            Measure-Object -Property processedResultCount -Sum).Sum
+    } else {
+        0
+    }
+    Save-AdoRunReport `
+        -Entries $reportEntries.ToArray() `
+        -Summary @{
+            candidateRunCount   = $runs.Count
+            exportedRunCount    = $manifestRuns.Count
+            skippedRunCount     = $skippedRunCount
+            skippedNoTestCaseLinkRunCount = $unlinkedRunCount
+            skippedOutsideAreaPathRunCount = $outsideAreaRunCount
+            unavailableRunCount = $unavailableRuns.Count
+            exportedResultCount = $exportedResultCount
+        } `
+        -JsonPath $exportReportJsonPath `
+        -CsvPath $exportReportCsvPath
+    Write-AdoLog `
+        -Level Info `
+        -Message 'Export completed.' `
+        -Context @{
+            exportPath         = $exportPath
+            exportedRunCount   = $manifestRuns.Count
+            skippedRunCount    = $skippedRunCount
+            unavailableRunCount = $unavailableRuns.Count
+        }
+    Write-Host ''
+    Write-Host 'Export summary' -ForegroundColor Cyan
+    Write-Host "  Exported:                  $($manifestRuns.Count)"
+    Write-Host "  Skipped without Test Case: $unlinkedRunCount"
+    Write-Host "  Skipped outside Area Path: $outsideAreaRunCount"
+    Write-Host "  Other Area Path skips:     $($skippedRunCount - $unlinkedRunCount - $outsideAreaRunCount)"
+    Write-Host "  Unavailable:               $($unavailableRuns.Count)"
+    Write-Host "  Report JSON: $exportReportJsonPath" -ForegroundColor DarkGray
+    Write-Host "  Report CSV:  $exportReportCsvPath" -ForegroundColor DarkGray
 
     return $exportPath
 }
@@ -922,100 +1329,187 @@ function Import-AdoTestHistory {
         targetProject      = $Context.Project
         runs               = [Collections.Generic.List[object]]::new()
     }
+    $reportEntries = [Collections.Generic.List[object]]::new()
+    $reportTimestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $importReportJsonPath = Join-Path $resolvedExportPath "import-report-$reportTimestamp.json"
+    $importReportCsvPath = Join-Path $resolvedExportPath "import-report-$reportTimestamp.csv"
 
     $current = 0
     foreach ($manifestRun in $manifest.runs) {
         $current++
         Write-Step "Importing run $current/$($manifest.runCount): ID $($manifestRun.sourceRunId) - $($manifestRun.name)"
+        $newRun = $null
 
-        $runPath = Join-Path $resolvedExportPath ($manifestRun.path -replace '/', [IO.Path]::DirectorySeparatorChar)
-        $sourceRun = Get-Content -LiteralPath (Join-Path $runPath 'run.json') -Raw | ConvertFrom-Json
-        $resultDocument = Get-Content -LiteralPath (Join-Path $runPath 'results.json') -Raw | ConvertFrom-Json
-        $sourceResults = @($resultDocument.value)
-        $requiresAutomatedImport = @($sourceResults | Where-Object {
-                [string]::IsNullOrWhiteSpace(
-                    [string](Get-PropertyValue -Source $_ -Name 'automatedTestName')
-                )
-            }).Count -gt 0
+        try {
+            $runPath = Join-Path $resolvedExportPath ($manifestRun.path -replace '/', [IO.Path]::DirectorySeparatorChar)
+            $sourceRun = Get-Content `
+                -LiteralPath (Join-Path $runPath 'run.json') `
+                -Raw `
+                -ErrorAction Stop |
+                ConvertFrom-Json
+            $resultDocument = Get-Content `
+                -LiteralPath (Join-Path $runPath 'results.json') `
+                -Raw `
+                -ErrorAction Stop |
+                ConvertFrom-Json
+            $sourceResults = @($resultDocument.value)
+            $requiresAutomatedImport = @($sourceResults | Where-Object {
+                    [string]::IsNullOrWhiteSpace(
+                        [string](Get-PropertyValue -Source $_ -Name 'automatedTestName')
+                    )
+                }).Count -gt 0
 
-        $newRun = Invoke-AdoRestMethod `
-            -Context $Context `
-            -Method POST `
-            -Path "$encodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
-            -Body (New-RunCreatePayload -Run $sourceRun -ForceAutomated:$requiresAutomatedImport)
-
-        $resultMap = [Collections.Generic.List[object]]::new()
-        for ($offset = 0; $offset -lt $sourceResults.Count; $offset += 200) {
-            $lastIndex = [Math]::Min($offset + 199, $sourceResults.Count - 1)
-            $sourceBatch = @($sourceResults[$offset..$lastIndex])
-            $payloadBatch = @($sourceBatch | ForEach-Object { New-ResultCreatePayload -Result $_ })
-            $createdResponse = Invoke-AdoRestMethod `
+            $newRun = Invoke-AdoRestMethod `
                 -Context $Context `
                 -Method POST `
-                -Path "$encodedProject/_apis/test/Runs/$($newRun.id)/results?api-version=$($script:ApiVersion)" `
-                -Body $payloadBatch
-            $createdResults = @(Get-CollectionValue -Response $createdResponse)
+                -Path "$encodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
+                -Body (New-RunCreatePayload -Run $sourceRun -ForceAutomated:$requiresAutomatedImport)
 
-            if ($createdResults.Count -ne $sourceBatch.Count) {
-                throw "Azure DevOps created $($createdResults.Count) results for a batch of $($sourceBatch.Count)."
+            $resultMap = [Collections.Generic.List[object]]::new()
+            for ($offset = 0; $offset -lt $sourceResults.Count; $offset += 200) {
+                $lastIndex = [Math]::Min($offset + 199, $sourceResults.Count - 1)
+                $sourceBatch = @($sourceResults[$offset..$lastIndex])
+                $payloadBatch = @($sourceBatch | ForEach-Object { New-ResultCreatePayload -Result $_ })
+                $createdResponse = Invoke-AdoRestMethod `
+                    -Context $Context `
+                    -Method POST `
+                    -Path "$encodedProject/_apis/test/Runs/$($newRun.id)/results?api-version=$($script:ApiVersion)" `
+                    -Body $payloadBatch
+                $createdResults = @(Get-CollectionValue -Response $createdResponse)
+
+                if ($createdResults.Count -ne $sourceBatch.Count) {
+                    throw "Azure DevOps created $($createdResults.Count) results for a batch of $($sourceBatch.Count)."
+                }
+
+                for ($index = 0; $index -lt $sourceBatch.Count; $index++) {
+                    $resultMap.Add([pscustomobject]@{
+                            sourceResultId = $sourceBatch[$index].id
+                            targetResultId = $createdResults[$index].id
+                        })
+                }
             }
 
-            for ($index = 0; $index -lt $sourceBatch.Count; $index++) {
-                $resultMap.Add([pscustomobject]@{
-                        sourceResultId = $sourceBatch[$index].id
-                        targetResultId = $createdResults[$index].id
+            $runAttachmentDirectory = Join-Path $runPath 'attachments\run'
+            if (Test-Path -LiteralPath $runAttachmentDirectory -PathType Container) {
+                Import-AttachmentDirectory `
+                    -Context $Context `
+                    -Directory $runAttachmentDirectory `
+                    -ApiPath "$encodedProject/_apis/test/runs/$($newRun.id)/attachments?api-version=$($script:ApiVersion)"
+            }
+
+            foreach ($mappedResult in $resultMap) {
+                $resultAttachmentDirectory = Join-Path $runPath "attachments\results\$($mappedResult.sourceResultId)"
+                if (-not (Test-Path -LiteralPath $resultAttachmentDirectory -PathType Container)) {
+                    continue
+                }
+
+                Import-AttachmentDirectory `
+                    -Context $Context `
+                    -Directory $resultAttachmentDirectory `
+                    -ApiPath "$encodedProject/_apis/test/Runs/$($newRun.id)/Results/$($mappedResult.targetResultId)/attachments?api-version=$($script:ApiVersion)"
+            }
+
+            $sourceCompleteDate = Get-PropertyValue -Source $sourceRun -Name 'completeDate'
+            $completePayload = @{
+                state        = 'Completed'
+                completeDate = if ($sourceCompleteDate) {
+                    $sourceCompleteDate
+                } else {
+                    (Get-Date).ToUniversalTime().ToString('o')
+                }
+            }
+            $null = Invoke-AdoRestMethod `
+                -Context $Context `
+                -Method PATCH `
+                -Path "$encodedProject/_apis/test/runs/$($newRun.id)?api-version=$($script:ApiVersion)" `
+                -Body $completePayload
+
+            $migrationMap.runs.Add([pscustomobject]@{
+                    sourceRunId = $sourceRun.id
+                    targetRunId = $newRun.id
+                    results     = $resultMap.ToArray()
+                })
+            $reportEntries.Add([pscustomobject]@{
+                    operation            = 'Import'
+                    status               = 'Imported'
+                    sourceRunId          = $sourceRun.id
+                    targetRunId          = $newRun.id
+                    name                 = $manifestRun.name
+                    sourceResultCount    = $sourceResults.Count
+                    processedResultCount = $resultMap.Count
+                    unlinkedResultCount   = $null
+                    outsideAreaResultCount = $null
+                    reason               = $null
+                })
+        }
+        catch {
+            $reportEntries.Add([pscustomobject]@{
+                    operation            = 'Import'
+                    status               = if ($newRun) { 'FailedPartial' } else { 'Failed' }
+                    sourceRunId          = $manifestRun.sourceRunId
+                    targetRunId          = if ($newRun) { $newRun.id } else { $null }
+                    name                 = $manifestRun.name
+                    sourceResultCount    = Get-PropertyValue -Source $manifestRun -Name 'resultCount'
+                    processedResultCount = 0
+                    unlinkedResultCount   = $null
+                    outsideAreaResultCount = $null
+                    reason               = $_.Exception.Message
+                })
+
+            foreach ($remainingRun in @($manifest.runs | Select-Object -Skip $current)) {
+                $reportEntries.Add([pscustomobject]@{
+                        operation            = 'Import'
+                        status               = 'NotAttempted'
+                        sourceRunId          = $remainingRun.sourceRunId
+                        targetRunId          = $null
+                        name                 = $remainingRun.name
+                        sourceResultCount    = $remainingRun.resultCount
+                        processedResultCount = 0
+                        unlinkedResultCount   = $null
+                        outsideAreaResultCount = $null
+                        reason               = 'Import stopped after a previous run failed.'
                     })
             }
+
+            Save-AdoRunReport `
+                -Entries $reportEntries.ToArray() `
+                -Summary @{
+                    totalRunCount        = $manifest.runCount
+                    importedRunCount     = @($reportEntries | Where-Object status -eq 'Imported').Count
+                    failedRunCount       = @($reportEntries | Where-Object status -Like 'Failed*').Count
+                    notAttemptedRunCount = @($reportEntries | Where-Object status -eq 'NotAttempted').Count
+                } `
+                -JsonPath $importReportJsonPath `
+                -CsvPath $importReportCsvPath
+            Write-Host "Import report: $importReportJsonPath" -ForegroundColor DarkGray
+            throw
         }
-
-        $runAttachmentDirectory = Join-Path $runPath 'attachments\run'
-        if (Test-Path -LiteralPath $runAttachmentDirectory -PathType Container) {
-            Import-AttachmentDirectory `
-                -Context $Context `
-                -Directory $runAttachmentDirectory `
-                -ApiPath "$encodedProject/_apis/test/runs/$($newRun.id)/attachments?api-version=$($script:ApiVersion)"
-        }
-
-        foreach ($mappedResult in $resultMap) {
-            $resultAttachmentDirectory = Join-Path $runPath "attachments\results\$($mappedResult.sourceResultId)"
-            if (-not (Test-Path -LiteralPath $resultAttachmentDirectory -PathType Container)) {
-                continue
-            }
-
-            Import-AttachmentDirectory `
-                -Context $Context `
-                -Directory $resultAttachmentDirectory `
-                -ApiPath "$encodedProject/_apis/test/Runs/$($newRun.id)/Results/$($mappedResult.targetResultId)/attachments?api-version=$($script:ApiVersion)"
-        }
-
-        $sourceCompleteDate = Get-PropertyValue -Source $sourceRun -Name 'completeDate'
-        $completePayload = @{
-            state        = 'Completed'
-            completeDate = if ($sourceCompleteDate) {
-                $sourceCompleteDate
-            } else {
-                (Get-Date).ToUniversalTime().ToString('o')
-            }
-        }
-        $null = Invoke-AdoRestMethod `
-            -Context $Context `
-            -Method PATCH `
-            -Path "$encodedProject/_apis/test/runs/$($newRun.id)?api-version=$($script:ApiVersion)" `
-            -Body $completePayload
-
-        $migrationMap.runs.Add([pscustomobject]@{
-                sourceRunId = $sourceRun.id
-                targetRunId = $newRun.id
-                results     = $resultMap.ToArray()
-            })
     }
 
     $mapPath = Join-Path $resolvedExportPath "migration-map-$((Get-Date).ToString('yyyyMMdd-HHmmss')).json"
     Save-JsonFile -Value $migrationMap -Path $mapPath
+    Save-AdoRunReport `
+        -Entries $reportEntries.ToArray() `
+        -Summary @{
+            totalRunCount        = $manifest.runCount
+            importedRunCount     = $reportEntries.Count
+            failedRunCount       = 0
+            notAttemptedRunCount = 0
+        } `
+        -JsonPath $importReportJsonPath `
+        -CsvPath $importReportCsvPath
+    Write-Host ''
+    Write-Host 'Import summary' -ForegroundColor Cyan
+    Write-Host "  Imported:   $($reportEntries.Count)"
+    Write-Host '  Failed:     0'
+    Write-Host "  Report JSON: $importReportJsonPath" -ForegroundColor DarkGray
+    Write-Host "  Report CSV:  $importReportCsvPath" -ForegroundColor DarkGray
     return $mapPath
 }
 
 Export-ModuleMember -Function @(
+    'Initialize-AdoLogging',
+    'Write-AdoLog',
     'New-AdoContext',
     'Test-AdoAccess',
     'Export-AdoTestHistory',
