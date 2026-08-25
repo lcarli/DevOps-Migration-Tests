@@ -29,7 +29,9 @@ function New-InteractiveContext {
     param(
         [Parameter(Mandatory)]
         [ValidateSet('Read', 'Write')]
-        [string]$AccessLevel
+        [string]$AccessLevel,
+
+        [switch]$RequireWorkItemRead
     )
 
     Write-Host ''
@@ -53,7 +55,12 @@ function New-InteractiveContext {
 
     if ($authenticationMethod -eq 'Pat') {
         Write-Host "The PAT requires Test Management $AccessLevel access." -ForegroundColor DarkGray
-        Write-Host 'Area Path filtering also requires Work Items Read access.' -ForegroundColor DarkGray
+        if ($AccessLevel -eq 'Read') {
+            Write-Host 'Area Path filtering also requires Work Items Read access.' -ForegroundColor DarkGray
+        }
+        if ($RequireWorkItemRead) {
+            Write-Host 'Planned run linking also requires Work Items Read access.' -ForegroundColor DarkGray
+        }
         $contextParameters.Pat = Read-Host 'PAT (it will not be saved)' -AsSecureString
     }
 
@@ -106,7 +113,38 @@ function Invoke-ImportMenu {
     Write-Host 'Import recreates runs and results with new IDs.' -ForegroundColor Yellow
     Write-Host 'It does not preserve audit history or references without explicit mapping.' -ForegroundColor Yellow
 
-    $context = New-InteractiveContext -AccessLevel Write
+    Write-Host ''
+    Write-Host 'Planned run linking mode' -ForegroundColor Cyan
+    Write-Host '  1. Prefer (recommended/default) - link planned runs when possible, otherwise fall back to unplanned import'
+    Write-Host '  2. Require - do not create runs when planned links cannot be resolved'
+    Write-Host '  3. Disabled - always import through the existing unplanned path'
+
+    $linkChoice = Read-Host 'Choose [1-3] (default = 1)'
+    if ([string]::IsNullOrWhiteSpace($linkChoice)) {
+        $linkChoice = '1'
+    }
+    while ($linkChoice -notin @('1', '2', '3')) {
+        $linkChoice = Read-Host 'Choose [1-3] (default = 1)'
+        if ([string]::IsNullOrWhiteSpace($linkChoice)) {
+            $linkChoice = '1'
+        }
+    }
+
+    $linkMode = switch ($linkChoice) {
+        '2' { 'Require' }
+        '3' { 'Disabled' }
+        default { 'Prefer' }
+    }
+
+    $reflectedWorkItemIdField = 'Custom.ReflectedWorkItemId'
+    if ($linkMode -ne 'Disabled') {
+        $reflectedFieldInput = Read-Host "Reflected work item ID field [$reflectedWorkItemIdField]"
+        if (-not [string]::IsNullOrWhiteSpace($reflectedFieldInput)) {
+            $reflectedWorkItemIdField = $reflectedFieldInput.Trim()
+        }
+    }
+
+    $context = New-InteractiveContext -AccessLevel Write -RequireWorkItemRead:($linkMode -ne 'Disabled')
     $exportPath = Read-RequiredValue 'Export directory containing manifest.json'
 
     $confirmation = Read-Host "Type IMPORT to confirm data creation in '$($context.Project)'"
@@ -115,7 +153,11 @@ function Invoke-ImportMenu {
         return
     }
 
-    $mapPath = Import-AdoTestHistory -Context $context -ExportPath $exportPath
+    $mapPath = Import-AdoTestHistory `
+        -Context $context `
+        -ExportPath $exportPath `
+        -LinkMode $linkMode `
+        -ReflectedWorkItemIdField $reflectedWorkItemIdField
     Write-Host ''
     Write-Host "Import completed. ID map: $mapPath" -ForegroundColor Green
 }
