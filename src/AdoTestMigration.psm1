@@ -2420,13 +2420,15 @@ function Resolve-AdoPlannedRunLinks {
                 reason        = 'links.json was not found in the exported run directory.'
             })
         return [pscustomobject]@{
-            IsLinkable           = $false
-            TargetPlanId         = $null
-            TargetSuiteIds       = @()
-            TargetPointIds       = @()
-            ResolvedResults      = @()
-            UnresolvedReferences = $unresolvedReferences.ToArray()
-            Reason               = Get-AdoLinkResolutionReason -UnresolvedReferences $unresolvedReferences.ToArray() -AdditionalReasons $additionalReasons.ToArray()
+            IsLinkable               = $false
+            TargetPlanId             = $null
+            TargetSuiteIds           = @()
+            TargetPointIds           = @()
+            ResolvedResults          = @()
+            AdditionalReasons        = $additionalReasons.ToArray()
+            UnresolvedReferenceCount = $unresolvedReferences.Count
+            UnresolvedReferences     = $unresolvedReferences.ToArray()
+            Reason                   = Get-AdoLinkResolutionReason -UnresolvedReferences $unresolvedReferences.ToArray() -AdditionalReasons $additionalReasons.ToArray()
         }
     }
 

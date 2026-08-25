@@ -161,6 +161,17 @@ if (-not $module) {
     $missingConfigResolution = Resolve-AdoTargetTestPoint -Points $points -SourceConfigurationName $null
     Assert-False -Condition $missingConfigResolution.Resolved -Message 'Multiple target points without a source configuration name should remain unresolved.'
 
+    $missingLinksResolution = Resolve-AdoPlannedRunLinks `
+        -Context ([pscustomobject]@{}) `
+        -Manifest ([pscustomobject]@{}) `
+        -RunPath (Join-Path $PSScriptRoot '__missing-links__') `
+        -SourceResults @([pscustomobject]@{ id = 100 }) `
+        -ReflectedIndex @{} `
+        -PointCache @{}
+    Assert-False -Condition $missingLinksResolution.IsLinkable -Message 'A run without links.json should not be linkable.'
+    Assert-Equal -Actual $missingLinksResolution.UnresolvedReferenceCount -Expected 1 -Message 'A missing links.json file should report one unresolved reference.'
+    Assert-Equal -Actual $missingLinksResolution.AdditionalReasons.Count -Expected 0 -Message 'A missing links.json file should return an empty additional-reasons collection.'
+
     $script:capturedResultPath = $null
     function Invoke-AdoRestMethod {
         param($Context, $Method, $Path, $Body)
