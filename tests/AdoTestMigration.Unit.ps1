@@ -178,6 +178,28 @@ if (-not $module) {
     $blankOutcomePayload = New-ResultCreatePayload -Result ([pscustomobject]@{ id = 201; outcome = '' })
     Assert-Equal -Actual $blankOutcomePayload.outcome -Expected 'Unspecified' -Message 'A blank source outcome should use the Azure DevOps Unspecified outcome.'
 
+    $networkException = [InvalidOperationException]::new('Simulated network failure.')
+    $networkErrorRecord = [System.Management.Automation.ErrorRecord]::new(
+        $networkException,
+        'NetworkFailure',
+        [System.Management.Automation.ErrorCategory]::ConnectionError,
+        $null
+    )
+    Assert-Equal -Actual (Get-AdoErrorMessage -ErrorRecord $networkErrorRecord) -Expected 'Simulated network failure.' -Message 'Errors without an HTTP response should preserve their original message.'
+    $wrappedNetworkException = New-AdoRestException -ErrorRecord $networkErrorRecord -Method GET -Uri 'https://dev.azure.com/example'
+    Assert-False -Condition $wrappedNetworkException.Data.Contains('StatusCode') -Message 'Errors without an HTTP response should not invent a status code.'
+
+    $httpException = [InvalidOperationException]::new('Simulated HTTP failure.')
+    $httpException | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = 404 })
+    $httpErrorRecord = [System.Management.Automation.ErrorRecord]::new(
+        $httpException,
+        'HttpFailure',
+        [System.Management.Automation.ErrorCategory]::InvalidOperation,
+        $null
+    )
+    $httpErrorRecord.ErrorDetails = [System.Management.Automation.ErrorDetails]::new('{"message":"Test run was not found."}')
+    Assert-Equal -Actual (Get-AdoErrorMessage -ErrorRecord $httpErrorRecord) -Expected 'Azure DevOps returned HTTP 404. Test run was not found.' -Message 'HTTP errors should retain status and service details.'
+
     $script:capturedResultPath = $null
     function Invoke-AdoRestMethod {
         param($Context, $Method, $Path, $Body)

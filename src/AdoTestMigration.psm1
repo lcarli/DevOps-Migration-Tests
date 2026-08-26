@@ -169,12 +169,21 @@ function Get-AdoErrorMessage {
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    $response = $ErrorRecord.Exception.Response
+    $responseProperty = $ErrorRecord.Exception.PSObject.Properties['Response']
+    $response = if ($null -ne $responseProperty) {
+        $responseProperty.Value
+    } else {
+        $null
+    }
     if (-not $response) {
         return $ErrorRecord.Exception.Message
     }
 
-    $statusCode = [int]$response.StatusCode
+    $statusCodeProperty = $response.PSObject.Properties['StatusCode']
+    if ($null -eq $statusCodeProperty) {
+        return $ErrorRecord.Exception.Message
+    }
+    $statusCode = [int]$statusCodeProperty.Value
     $serviceMessage = $null
     if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
         try {
@@ -212,8 +221,19 @@ function New-AdoRestException {
     $exception.Data['Method'] = $Method
     $exception.Data['Uri'] = $Uri
 
-    if ($ErrorRecord.Exception.Response) {
-        $exception.Data['StatusCode'] = [int]$ErrorRecord.Exception.Response.StatusCode
+    $responseProperty = $ErrorRecord.Exception.PSObject.Properties['Response']
+    $response = if ($null -ne $responseProperty) {
+        $responseProperty.Value
+    } else {
+        $null
+    }
+    $statusCodeProperty = if ($null -ne $response) {
+        $response.PSObject.Properties['StatusCode']
+    } else {
+        $null
+    }
+    if ($null -ne $statusCodeProperty) {
+        $exception.Data['StatusCode'] = [int]$statusCodeProperty.Value
     }
 
     return $exception
