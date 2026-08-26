@@ -172,6 +172,12 @@ if (-not $module) {
     Assert-Equal -Actual $missingLinksResolution.UnresolvedReferenceCount -Expected 1 -Message 'A missing links.json file should report one unresolved reference.'
     Assert-Equal -Actual $missingLinksResolution.AdditionalReasons.Count -Expected 0 -Message 'A missing links.json file should return an empty additional-reasons collection.'
 
+    $missingOutcomePayload = New-ResultCreatePayload -Result ([pscustomobject]@{ id = 200 })
+    Assert-Equal -Actual $missingOutcomePayload.outcome -Expected 'Unspecified' -Message 'A source result without outcome should use the Azure DevOps Unspecified outcome.'
+
+    $blankOutcomePayload = New-ResultCreatePayload -Result ([pscustomobject]@{ id = 201; outcome = '' })
+    Assert-Equal -Actual $blankOutcomePayload.outcome -Expected 'Unspecified' -Message 'A blank source outcome should use the Azure DevOps Unspecified outcome.'
+
     $script:capturedResultPath = $null
     function Invoke-AdoRestMethod {
         param($Context, $Method, $Path, $Body)

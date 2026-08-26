@@ -2211,14 +2211,20 @@ function New-ResultCreatePayload {
         [object]$Result
     )
 
+    $sourceResultId = Get-PropertyValue -Source $Result -Name 'id'
     $sourceComment = Get-PropertyValue -Source $Result -Name 'comment'
+    $sourceOutcome = [string](Get-PropertyValue -Source $Result -Name 'outcome' -DefaultValue 'Unspecified')
+    if ([string]::IsNullOrWhiteSpace($sourceOutcome)) {
+        $sourceOutcome = 'Unspecified'
+    }
+
     $payload = @{
         state   = 'Completed'
-        outcome = $Result.outcome
+        outcome = $sourceOutcome
         comment = if ($sourceComment) {
-            "$sourceComment`nSource result ID: $($Result.id)"
+            "$sourceComment`nSource result ID: $sourceResultId"
         } else {
-            "Source result ID: $($Result.id)"
+            "Source result ID: $sourceResultId"
         }
     }
 
@@ -2241,7 +2247,7 @@ function New-ResultCreatePayload {
     }
 
     if (-not $payload.ContainsKey('automatedTestName')) {
-        $payload.automatedTestName = "MigratedTestResult.$($Result.id)"
+        $payload.automatedTestName = "MigratedTestResult.$sourceResultId"
         $payload.automatedTestType = 'Migrated'
     }
 
