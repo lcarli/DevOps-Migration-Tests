@@ -178,6 +178,66 @@ if (-not $module) {
     $blankOutcomePayload = New-ResultCreatePayload -Result ([pscustomobject]@{ id = 201; outcome = '' })
     Assert-Equal -Actual $blankOutcomePayload.outcome -Expected 'Unspecified' -Message 'A blank source outcome should use the Azure DevOps Unspecified outcome.'
 
+    Assert-Equal -Actual (Get-AdoOrganizationName -OrganizationUrl 'https://dev.azure.com/contoso') -Expected 'contoso' -Message 'Organization names should be parsed from dev.azure.com URLs.'
+    Assert-Equal -Actual (Get-AdoOrganizationName -OrganizationUrl 'https://contoso.visualstudio.com') -Expected 'contoso' -Message 'Organization names should be parsed from visualstudio.com URLs.'
+
+    $sourceIdentity = [pscustomobject]@{
+        displayName = 'Original User'
+        uniqueName  = 'original.user@contoso.com'
+    }
+    function Invoke-AdoIdentityRestMethod {
+        param($Context, $PrincipalName)
+        return [pscustomobject]@{
+            value = @(
+                [pscustomobject]@{
+                    id          = 'target-user-id'
+                    displayName = 'Original User'
+                    isActive    = $true
+                    properties  = [pscustomobject]@{
+                        Mail = [pscustomobject]@{ '$value' = 'original.user@contoso.com' }
+                    }
+                }
+            )
+        }
+    }
+
+    $identityResolution = Resolve-AdoTargetIdentity `
+        -Context ([pscustomobject]@{ OrganizationUrl = 'https://dev.azure.com/contoso'; Headers = @{} }) `
+        -SourceIdentity $sourceIdentity `
+        -Cache @{}
+    Assert-True -Condition $identityResolution.Resolved -Message 'An exact active target identity should resolve.'
+    Assert-Equal -Actual $identityResolution.Status -Expected 'Mapped' -Message 'Resolved identities should report Mapped.'
+    Assert-Equal -Actual $identityResolution.TargetId -Expected 'target-user-id' -Message 'The target identity ID should be retained.'
+
+    $ownerPayload = New-RunCreatePayload `
+        -Run ([pscustomobject]@{ id = 300; name = 'Owned run' }) `
+        -OwnerResolution $identityResolution
+    Assert-Equal -Actual $ownerPayload.owner.id -Expected 'target-user-id' -Message 'Run creation should use the resolved target owner ID.'
+    Assert-True -Condition ($ownerPayload.comment -like '*Original User <original.user@contoso.com>*') -Message 'Run comments should retain the original owner identity.'
+
+    $runnerPayload = New-ResultCreatePayload `
+        -Result ([pscustomobject]@{ id = 301; outcome = 'Passed' }) `
+        -RunByResolution $identityResolution
+    Assert-Equal -Actual $runnerPayload.runBy.id -Expected 'target-user-id' -Message 'Result creation should use the resolved target runner ID.'
+    Assert-True -Condition ($runnerPayload.comment -like '*Original runner: Original User <original.user@contoso.com>*') -Message 'Result comments should retain the original runner identity.'
+
+    $runnerStatusMap = @([pscustomobject]@{ sourceResultId = 301; runByStatus = 'Mapped' })
+    $failedRunnerResolution = $identityResolution.PSObject.Copy()
+    $failedRunnerResolution.Status = 'ApplyFailed'
+    Sync-AdoResultMapRunByStatuses `
+        -ResultMap $runnerStatusMap `
+        -IdentityMappings ([pscustomobject]@{ ResultRunBy = @{ '301' = $failedRunnerResolution } }) `
+        -SourceResultIds @(301)
+    Assert-Equal -Actual $runnerStatusMap[0].runByStatus -Expected 'ApplyFailed' -Message 'Result maps should reflect runner fallback status changes.'
+
+    $notAppliedResolution = $identityResolution.PSObject.Copy()
+    Confirm-AdoRunOwnerMapping `
+        -Context ([pscustomobject]@{}) `
+        -EncodedProject 'Target' `
+        -TargetRun ([pscustomobject]@{ owner = [pscustomobject]@{ id = 'different-user-id' } }) `
+        -OwnerResolution $notAppliedResolution
+    Assert-Equal -Actual $notAppliedResolution.Status -Expected 'NotApplied' -Message 'A target run that ignores the requested owner should be reported.'
+
     $networkException = [InvalidOperationException]::new('Simulated network failure.')
     $networkErrorRecord = [System.Management.Automation.ErrorRecord]::new(
         $networkException,
@@ -272,13 +332,33 @@ if (-not $module) {
         [pscustomobject]@{ id = 101 },
         [pscustomobject]@{ id = 102 }
     )
+    $notAvailableIdentity = [pscustomobject]@{
+        SourceAvailable     = $false
+        SourceDisplayName   = $null
+        SourcePrincipalName = $null
+        Resolved            = $false
+        Status              = 'NotAvailable'
+        TargetId            = $null
+        TargetDisplayName   = $null
+        Reason              = 'Not available in test data.'
+    }
+    $testIdentityMappings = [pscustomobject]@{
+        Owner                    = $notAvailableIdentity.PSObject.Copy()
+        ResultRunBy              = @{
+            '101' = $notAvailableIdentity.PSObject.Copy()
+            '102' = $notAvailableIdentity.PSObject.Copy()
+        }
+        MappedRunnerCount        = 0
+        UnresolvedRunnerCount    = 0
+    }
     $plannedOutcome = Import-AdoPlannedRun `
         -Context ([pscustomobject]@{}) `
         -EncodedProject 'Target' `
         -RunPath (Join-Path $PSScriptRoot '__missing-run__') `
         -SourceRun ([pscustomobject]@{}) `
         -SourceResults $duplicateSourceResults `
-        -LinkResolution $duplicatePointResolution
+        -LinkResolution $duplicatePointResolution `
+        -IdentityMappings $testIdentityMappings
 
     Assert-Equal -Actual $script:capturedPlannedCreateBody.pointIds -Expected @(55, 55) -Message 'Planned run creation should preserve repeated test points.'
     Assert-Equal -Actual $plannedOutcome.TargetPointIds -Expected @(55, 55) -Message 'The planned import outcome should preserve repeated test points.'
@@ -292,7 +372,8 @@ if (-not $module) {
             -RunPath (Join-Path $PSScriptRoot '__missing-run__') `
             -SourceRun ([pscustomobject]@{}) `
             -SourceResults $duplicateSourceResults `
-            -LinkResolution $duplicatePointResolution
+            -LinkResolution $duplicatePointResolution `
+            -IdentityMappings $testIdentityMappings
         throw 'Expected the simulated planned import failure.'
     }
     catch {

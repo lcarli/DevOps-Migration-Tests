@@ -316,6 +316,274 @@ function Invoke-AdoRestMethod {
     }
 }
 
+function Get-AdoOrganizationName {
+    param(
+        [Parameter(Mandatory)]
+        [string]$OrganizationUrl
+    )
+
+    $uri = [uri]$OrganizationUrl
+    if ($uri.Host.Equals('dev.azure.com', [StringComparison]::OrdinalIgnoreCase)) {
+        $segments = @($uri.AbsolutePath.Trim('/') -split '/' | Where-Object { $_ })
+        if ($segments.Count -gt 0) {
+            return $segments[0]
+        }
+    }
+    elseif ($uri.Host.EndsWith('.visualstudio.com', [StringComparison]::OrdinalIgnoreCase)) {
+        return $uri.Host.Substring(0, $uri.Host.Length - '.visualstudio.com'.Length)
+    }
+
+    throw "Could not determine the Azure DevOps organization name from '$OrganizationUrl'."
+}
+
+function Invoke-AdoIdentityRestMethod {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$PrincipalName
+    )
+
+    $organizationName = Get-AdoOrganizationName -OrganizationUrl $Context.OrganizationUrl
+    $encodedOrganization = [uri]::EscapeDataString($organizationName)
+    $encodedPrincipalName = [uri]::EscapeDataString($PrincipalName)
+    $uri = "https://vssps.dev.azure.com/$encodedOrganization/_apis/identities" +
+        "?searchFilter=General&filterValue=$encodedPrincipalName" +
+        "&queryMembership=None&api-version=$($script:ApiVersion)"
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    Write-AdoLog `
+        -Level Debug `
+        -Message 'Azure DevOps identity lookup started.' `
+        -Context @{ uri = $uri }
+
+    try {
+        $response = Invoke-RestMethod `
+            -Uri $uri `
+            -Method GET `
+            -Headers $Context.Headers `
+            -ErrorAction Stop
+        $stopwatch.Stop()
+        Write-AdoLog `
+            -Level Debug `
+            -Message 'Azure DevOps identity lookup completed.' `
+            -Context @{ uri = $uri; durationMs = $stopwatch.ElapsedMilliseconds }
+        return $response
+    }
+    catch {
+        $stopwatch.Stop()
+        $exception = New-AdoRestException -ErrorRecord $_ -Method GET -Uri $uri
+        Write-AdoLog `
+            -Level Warning `
+            -Message 'Azure DevOps identity lookup failed.' `
+            -Context @{
+                uri        = $uri
+                durationMs = $stopwatch.ElapsedMilliseconds
+                error      = $exception.Message
+            }
+        throw $exception
+    }
+}
+
+function Get-AdoIdentityPrincipalNames {
+    param(
+        [AllowNull()]
+        [object]$Identity
+    )
+
+    if ($null -eq $Identity) {
+        return @()
+    }
+
+    $names = [Collections.Generic.List[string]]::new()
+    foreach ($propertyName in @('uniqueName', 'principalName', 'mailAddress')) {
+        $value = [string](Get-PropertyValue -Source $Identity -Name $propertyName)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $names.Add($value.Trim())
+        }
+    }
+
+    $properties = Get-PropertyValue -Source $Identity -Name 'properties'
+    foreach ($propertyName in @('Account', 'Mail', 'SignInAddress')) {
+        $property = Get-PropertyValue -Source $properties -Name $propertyName
+        $value = [string](Get-PropertyValue -Source $property -Name '$value')
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $names.Add($value.Trim())
+        }
+    }
+
+    return @($names.ToArray() | Select-Object -Unique)
+}
+
+function Resolve-AdoTargetIdentity {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [AllowNull()]
+        [object]$SourceIdentity,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Cache
+    )
+
+    $sourceDisplayName = [string](Get-PropertyValue -Source $SourceIdentity -Name 'displayName')
+    $sourcePrincipalNames = @(Get-AdoIdentityPrincipalNames -Identity $SourceIdentity)
+    $sourcePrincipalName = if ($sourcePrincipalNames.Count -gt 0) {
+        $sourcePrincipalNames[0]
+    } else {
+        $null
+    }
+    $sourceAvailable = -not [string]::IsNullOrWhiteSpace($sourceDisplayName) -or
+        -not [string]::IsNullOrWhiteSpace($sourcePrincipalName)
+
+    if (-not $sourceAvailable) {
+        return [pscustomobject]@{
+            SourceAvailable     = $false
+            SourceDisplayName   = $null
+            SourcePrincipalName = $null
+            Resolved            = $false
+            Status              = 'NotAvailable'
+            TargetId            = $null
+            TargetDisplayName   = $null
+            Reason              = 'The source identity was not available in the export.'
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($sourcePrincipalName)) {
+        return [pscustomobject]@{
+            SourceAvailable     = $true
+            SourceDisplayName   = $sourceDisplayName
+            SourcePrincipalName = $null
+            Resolved            = $false
+            Status              = 'MissingPrincipalName'
+            TargetId            = $null
+            TargetDisplayName   = $null
+            Reason              = "Source identity '$sourceDisplayName' does not include an account or email address."
+        }
+    }
+
+    $cacheKey = $sourcePrincipalName.ToLowerInvariant()
+    if (-not $Cache.ContainsKey($cacheKey)) {
+        try {
+            $response = Invoke-AdoIdentityRestMethod -Context $Context -PrincipalName $sourcePrincipalName
+            $candidates = [Collections.Generic.List[object]]::new()
+            foreach ($candidate in @(Get-CollectionValue -Response $response)) {
+                $isActive = Get-PropertyValue -Source $candidate -Name 'isActive' -DefaultValue $true
+                if (-not [bool]$isActive) {
+                    continue
+                }
+
+                $candidateNames = @(Get-AdoIdentityPrincipalNames -Identity $candidate)
+                if (@($candidateNames | Where-Object {
+                            $_.Equals($sourcePrincipalName, [StringComparison]::OrdinalIgnoreCase)
+                        }).Count -gt 0) {
+                    $candidates.Add($candidate)
+                }
+            }
+
+            $uniqueCandidates = @($candidates.ToArray() |
+                    Group-Object { [string](Get-PropertyValue -Source $_ -Name 'id') } |
+                    ForEach-Object { $_.Group[0] })
+            if ($uniqueCandidates.Count -eq 1) {
+                $Cache[$cacheKey] = [pscustomobject]@{
+                    Resolved          = $true
+                    Status            = 'Mapped'
+                    TargetId          = [string](Get-PropertyValue -Source $uniqueCandidates[0] -Name 'id')
+                    TargetDisplayName = [string](Get-PropertyValue -Source $uniqueCandidates[0] -Name 'displayName')
+                    Reason            = $null
+                }
+            }
+            elseif ($uniqueCandidates.Count -eq 0) {
+                $Cache[$cacheKey] = [pscustomobject]@{
+                    Resolved          = $false
+                    Status            = 'NotFound'
+                    TargetId          = $null
+                    TargetDisplayName = $null
+                    Reason            = "No active target identity matched '$sourcePrincipalName'."
+                }
+            }
+            else {
+                $Cache[$cacheKey] = [pscustomobject]@{
+                    Resolved          = $false
+                    Status            = 'Ambiguous'
+                    TargetId          = $null
+                    TargetDisplayName = $null
+                    Reason            = "Multiple active target identities matched '$sourcePrincipalName'."
+                }
+            }
+        }
+        catch {
+            $Cache[$cacheKey] = [pscustomobject]@{
+                Resolved          = $false
+                Status            = 'LookupFailed'
+                TargetId          = $null
+                TargetDisplayName = $null
+                Reason            = "Target identity lookup failed for '$sourcePrincipalName'. $($_.Exception.Message)"
+            }
+        }
+    }
+
+    $targetResolution = $Cache[$cacheKey]
+    return [pscustomobject]@{
+        SourceAvailable     = $true
+        SourceDisplayName   = $sourceDisplayName
+        SourcePrincipalName = $sourcePrincipalName
+        Resolved            = $targetResolution.Resolved
+        Status              = $targetResolution.Status
+        TargetId            = $targetResolution.TargetId
+        TargetDisplayName   = $targetResolution.TargetDisplayName
+        Reason              = $targetResolution.Reason
+    }
+}
+
+function Resolve-AdoRunIdentityMappings {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [object]$SourceRun,
+
+        [Parameter(Mandatory)]
+        [object[]]$SourceResults,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Cache
+    )
+
+    $ownerResolution = Resolve-AdoTargetIdentity `
+        -Context $Context `
+        -SourceIdentity (Get-PropertyValue -Source $SourceRun -Name 'owner') `
+        -Cache $Cache
+    $resultRunBy = @{}
+    $mappedRunnerCount = 0
+    $unresolvedRunnerCount = 0
+    foreach ($sourceResult in $SourceResults) {
+        $sourceResultId = [string](Get-PropertyValue -Source $sourceResult -Name 'id')
+        $runnerResolution = Resolve-AdoTargetIdentity `
+            -Context $Context `
+            -SourceIdentity (Get-PropertyValue -Source $sourceResult -Name 'runBy') `
+            -Cache $Cache
+        $resultRunBy[$sourceResultId] = $runnerResolution
+        if ($runnerResolution.SourceAvailable) {
+            if ($runnerResolution.Resolved) {
+                $mappedRunnerCount++
+            }
+            else {
+                $unresolvedRunnerCount++
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Owner                    = $ownerResolution
+        ResultRunBy              = $resultRunBy
+        MappedRunnerCount        = $mappedRunnerCount
+        UnresolvedRunnerCount    = $unresolvedRunnerCount
+    }
+}
+
 function Save-AdoBinary {
     param(
         [Parameter(Mandatory)]
@@ -439,6 +707,12 @@ function Save-AdoRunReport {
         'targetPlanId',
         'targetSuiteIds',
         'unresolvedReferenceCount',
+        'ownerMappingStatus',
+        'ownerMappingReason',
+        'sourceOwner',
+        'targetOwnerId',
+        'mappedRunnerCount',
+        'unresolvedRunnerCount',
         'reason'
     )
     if ($Entries.Count -gt 0) {
@@ -2169,6 +2443,24 @@ function New-AdoImportReportEntry {
         [object]$UnresolvedReferenceCount,
 
         [AllowNull()]
+        [string]$OwnerMappingStatus,
+
+        [AllowNull()]
+        [string]$OwnerMappingReason,
+
+        [AllowNull()]
+        [string]$SourceOwner,
+
+        [AllowNull()]
+        [string]$TargetOwnerId,
+
+        [AllowNull()]
+        [object]$MappedRunnerCount,
+
+        [AllowNull()]
+        [object]$UnresolvedRunnerCount,
+
+        [AllowNull()]
         [string]$Reason
     )
 
@@ -2191,8 +2483,40 @@ function New-AdoImportReportEntry {
             $null
         }
         unresolvedReferenceCount = $UnresolvedReferenceCount
+        ownerMappingStatus       = $OwnerMappingStatus
+        ownerMappingReason       = $OwnerMappingReason
+        sourceOwner              = $SourceOwner
+        targetOwnerId            = $TargetOwnerId
+        mappedRunnerCount        = $MappedRunnerCount
+        unresolvedRunnerCount    = $UnresolvedRunnerCount
         reason                   = $Reason
     }
+}
+
+function Get-AdoIdentityResolutionLabel {
+    param(
+        [AllowNull()]
+        [object]$Resolution
+    )
+
+    if ($null -eq $Resolution) {
+        return $null
+    }
+
+    $displayName = [string](Get-PropertyValue -Source $Resolution -Name 'SourceDisplayName')
+    $principalName = [string](Get-PropertyValue -Source $Resolution -Name 'SourcePrincipalName')
+    if (-not [string]::IsNullOrWhiteSpace($displayName) -and
+        -not [string]::IsNullOrWhiteSpace($principalName)) {
+        return "$displayName <$principalName>"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($displayName)) {
+        return $displayName
+    }
+    if (-not [string]::IsNullOrWhiteSpace($principalName)) {
+        return $principalName
+    }
+
+    return $null
 }
 
 function New-RunCreatePayload {
@@ -2205,17 +2529,32 @@ function New-RunCreatePayload {
         [AllowEmptyCollection()]
         [int[]]$PointIds,
 
+        [AllowNull()]
+        [object]$OwnerResolution,
+
         [switch]$ForceAutomated
     )
 
+    $originalOwner = Get-AdoIdentityResolutionLabel -Resolution $OwnerResolution
     $payload = @{
         name      = $Run.name
         state     = 'InProgress'
-        comment   = "Recreated from Azure DevOps Test Run ID $($Run.id)."
+        comment   = if ([string]::IsNullOrWhiteSpace($originalOwner)) {
+            "Recreated from Azure DevOps Test Run ID $($Run.id)."
+        } else {
+            "Recreated from Azure DevOps Test Run ID $($Run.id). Original owner: $originalOwner."
+        }
         automated = $ForceAutomated.IsPresent -or
             [bool](Get-PropertyValue -Source $Run -Name 'isAutomated' -DefaultValue $false)
     }
     Add-PropertyIfPresent -Target $payload -Source $Run -SourceName 'startedDate' -TargetName 'startDate'
+
+    if ($null -ne $OwnerResolution -and
+        [bool](Get-PropertyValue -Source $OwnerResolution -Name 'Resolved' -DefaultValue $false)) {
+        $payload.owner = @{
+            id = [string](Get-PropertyValue -Source $OwnerResolution -Name 'TargetId')
+        }
+    }
 
     if ($PSBoundParameters.ContainsKey('PlanId')) {
         $payload.plan = @{ id = $PlanId }
@@ -2228,11 +2567,23 @@ function New-RunCreatePayload {
 function New-ResultCreatePayload {
     param(
         [Parameter(Mandatory)]
-        [object]$Result
+        [object]$Result,
+
+        [AllowNull()]
+        [object]$RunByResolution
     )
 
     $sourceResultId = Get-PropertyValue -Source $Result -Name 'id'
     $sourceComment = Get-PropertyValue -Source $Result -Name 'comment'
+    $originalRunner = Get-AdoIdentityResolutionLabel -Resolution $RunByResolution
+    $commentParts = [Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace([string]$sourceComment)) {
+        $commentParts.Add([string]$sourceComment)
+    }
+    $commentParts.Add("Source result ID: $sourceResultId")
+    if (-not [string]::IsNullOrWhiteSpace($originalRunner)) {
+        $commentParts.Add("Original runner: $originalRunner")
+    }
     $sourceOutcome = [string](Get-PropertyValue -Source $Result -Name 'outcome' -DefaultValue 'Unspecified')
     if ([string]::IsNullOrWhiteSpace($sourceOutcome)) {
         $sourceOutcome = 'Unspecified'
@@ -2241,11 +2592,7 @@ function New-ResultCreatePayload {
     $payload = @{
         state   = 'Completed'
         outcome = $sourceOutcome
-        comment = if ($sourceComment) {
-            "$sourceComment`nSource result ID: $sourceResultId"
-        } else {
-            "Source result ID: $sourceResultId"
-        }
+        comment = $commentParts -join "`n"
     }
 
     foreach ($propertyName in @(
@@ -2271,6 +2618,13 @@ function New-ResultCreatePayload {
         $payload.automatedTestType = 'Migrated'
     }
 
+    if ($null -ne $RunByResolution -and
+        [bool](Get-PropertyValue -Source $RunByResolution -Name 'Resolved' -DefaultValue $false)) {
+        $payload.runBy = @{
+            id = [string](Get-PropertyValue -Source $RunByResolution -Name 'TargetId')
+        }
+    }
+
     return $payload
 }
 
@@ -2283,7 +2637,10 @@ function New-ResultUpdatePayload {
         [int]$TargetResultId,
 
         [AllowEmptyCollection()]
-        [int[]]$AssociatedBugIds
+        [int[]]$AssociatedBugIds,
+
+        [AllowNull()]
+        [object]$RunByResolution
     )
 
     $payload = @{ id = $TargetResultId }
@@ -2300,6 +2657,22 @@ function New-ResultUpdatePayload {
             'resolutionState'
         )) {
         Add-PropertyIfPresent -Target $payload -Source $Result -SourceName $propertyName
+    }
+
+    $originalRunner = Get-AdoIdentityResolutionLabel -Resolution $RunByResolution
+    if (-not [string]::IsNullOrWhiteSpace($originalRunner)) {
+        $sourceComment = [string](Get-PropertyValue -Source $Result -Name 'comment')
+        $payload.comment = if ([string]::IsNullOrWhiteSpace($sourceComment)) {
+            "Original runner: $originalRunner"
+        } else {
+            "$sourceComment`nOriginal runner: $originalRunner"
+        }
+    }
+    if ($null -ne $RunByResolution -and
+        [bool](Get-PropertyValue -Source $RunByResolution -Name 'Resolved' -DefaultValue $false)) {
+        $payload.runBy = @{
+            id = [string](Get-PropertyValue -Source $RunByResolution -Name 'TargetId')
+        }
     }
 
     if ($null -ne $AssociatedBugIds -and $AssociatedBugIds.Count -gt 0) {
@@ -2710,6 +3083,104 @@ function New-AdoPartialImportException {
     return $exception
 }
 
+function Confirm-AdoRunOwnerMapping {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$EncodedProject,
+
+        [Parameter(Mandatory)]
+        [object]$TargetRun,
+
+        [Parameter(Mandatory)]
+        [object]$OwnerResolution
+    )
+
+    if (-not [bool](Get-PropertyValue -Source $OwnerResolution -Name 'Resolved' -DefaultValue $false)) {
+        return
+    }
+
+    $effectiveOwner = Get-PropertyValue -Source $TargetRun -Name 'owner'
+    $effectiveOwnerId = [string](Get-PropertyValue -Source $effectiveOwner -Name 'id')
+    $requestedOwnerId = [string](Get-PropertyValue -Source $OwnerResolution -Name 'TargetId')
+    if ([string]::IsNullOrWhiteSpace($effectiveOwnerId) -or
+        $effectiveOwnerId -eq '00000000-0000-0000-0000-000000000000') {
+        try {
+            $targetRunDetails = Invoke-AdoRestMethod `
+                -Context $Context `
+                -Method GET `
+                -Path "$EncodedProject/_apis/test/runs/$($TargetRun.id)?includeDetails=true&api-version=$($script:ApiVersion)"
+            $effectiveOwner = Get-PropertyValue -Source $targetRunDetails -Name 'owner'
+            $effectiveOwnerId = [string](Get-PropertyValue -Source $effectiveOwner -Name 'id')
+        }
+        catch {
+            $OwnerResolution.Resolved = $false
+            $OwnerResolution.Status = 'VerificationFailed'
+            $OwnerResolution.Reason = "The owner was submitted, but the created run could not be read back for verification. $($_.Exception.Message)"
+            return
+        }
+    }
+
+    if (-not $effectiveOwnerId.Equals($requestedOwnerId, [StringComparison]::OrdinalIgnoreCase)) {
+        $OwnerResolution.Resolved = $false
+        $OwnerResolution.Status = 'NotApplied'
+        $OwnerResolution.Reason = 'Azure DevOps created the run but did not apply the mapped owner; the migration identity was retained.'
+    }
+}
+
+function Set-AdoRunnerMappingsApplyFailed {
+    param(
+        [Parameter(Mandatory)]
+        [object]$IdentityMappings,
+
+        [Parameter(Mandatory)]
+        [object[]]$SourceResults
+    )
+
+    foreach ($sourceResult in $SourceResults) {
+        $sourceResultId = [string](Get-PropertyValue -Source $sourceResult -Name 'id')
+        $resolution = $IdentityMappings.ResultRunBy[$sourceResultId]
+        if ($null -eq $resolution -or -not $resolution.Resolved) {
+            continue
+        }
+
+        $resolution.Resolved = $false
+        $resolution.Status = 'ApplyFailed'
+        $resolution.Reason = 'Azure DevOps rejected the mapped result runner; the migration identity was retained.'
+        $IdentityMappings.MappedRunnerCount--
+        $IdentityMappings.UnresolvedRunnerCount++
+    }
+}
+
+function Sync-AdoResultMapRunByStatuses {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$ResultMap,
+
+        [Parameter(Mandatory)]
+        [object]$IdentityMappings,
+
+        [Parameter(Mandatory)]
+        [object[]]$SourceResultIds
+    )
+
+    foreach ($mappedResult in $ResultMap) {
+        if ((Get-PropertyValue -Source $mappedResult -Name 'sourceResultId') -notin $SourceResultIds) {
+            continue
+        }
+
+        $sourceResultId = [string](Get-PropertyValue -Source $mappedResult -Name 'sourceResultId')
+        $resolution = $IdentityMappings.ResultRunBy[$sourceResultId]
+        $mappedResult.runByStatus = if ($null -ne $resolution) {
+            $resolution.Status
+        } else {
+            'NotAvailable'
+        }
+    }
+}
+
 function Import-AdoUnplannedRun {
     param(
         [Parameter(Mandatory)]
@@ -2725,7 +3196,10 @@ function Import-AdoUnplannedRun {
         [object]$SourceRun,
 
         [Parameter(Mandatory)]
-        [object[]]$SourceResults
+        [object[]]$SourceResults,
+
+        [Parameter(Mandatory)]
+        [object]$IdentityMappings
     )
 
     $requiresAutomatedImport = @($SourceResults | Where-Object {
@@ -2734,23 +3208,80 @@ function Import-AdoUnplannedRun {
             )
         }).Count -gt 0
 
-    $newRun = Invoke-AdoRestMethod `
+    $runPayload = New-RunCreatePayload `
+        -Run $SourceRun `
+        -OwnerResolution $IdentityMappings.Owner `
+        -ForceAutomated:$requiresAutomatedImport
+    try {
+        $newRun = Invoke-AdoRestMethod `
+            -Context $Context `
+            -Method POST `
+            -Path "$EncodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
+            -Body $runPayload
+    }
+    catch {
+        if (-not $runPayload.ContainsKey('owner') -or -not (Test-AdoHttpStatus -ErrorRecord $_ -StatusCode 400)) {
+            throw
+        }
+
+        $runPayload.Remove('owner')
+        $IdentityMappings.Owner.Resolved = $false
+        $IdentityMappings.Owner.Status = 'ApplyFailed'
+        $IdentityMappings.Owner.Reason = 'Azure DevOps rejected the mapped owner while creating the run; the migration identity was used instead.'
+        Write-AdoLog `
+            -Level Warning `
+            -Message 'Mapped Test Run owner was rejected; retrying without owner.' `
+            -Context @{ sourceRunId = $SourceRun.id; reason = $_.Exception.Message }
+        $newRun = Invoke-AdoRestMethod `
+            -Context $Context `
+            -Method POST `
+            -Path "$EncodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
+            -Body $runPayload
+    }
+    Confirm-AdoRunOwnerMapping `
         -Context $Context `
-        -Method POST `
-        -Path "$EncodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
-        -Body (New-RunCreatePayload -Run $SourceRun -ForceAutomated:$requiresAutomatedImport)
+        -EncodedProject $EncodedProject `
+        -TargetRun $newRun `
+        -OwnerResolution $IdentityMappings.Owner
 
     try {
         $resultMap = [Collections.Generic.List[object]]::new()
         for ($offset = 0; $offset -lt $SourceResults.Count; $offset += 200) {
             $lastIndex = [Math]::Min($offset + 199, $SourceResults.Count - 1)
             $sourceBatch = @($SourceResults[$offset..$lastIndex])
-            $payloadBatch = @($sourceBatch | ForEach-Object { New-ResultCreatePayload -Result $_ })
-            $createdResponse = Invoke-AdoRestMethod `
-                -Context $Context `
-                -Method POST `
-                -Path "$EncodedProject/_apis/test/Runs/$($newRun.id)/results?api-version=$($script:ApiVersion)" `
-                -Body $payloadBatch
+            $payloadBatch = @($sourceBatch | ForEach-Object {
+                    $sourceResultId = [string](Get-PropertyValue -Source $_ -Name 'id')
+                    New-ResultCreatePayload `
+                        -Result $_ `
+                        -RunByResolution $IdentityMappings.ResultRunBy[$sourceResultId]
+                })
+            try {
+                $createdResponse = Invoke-AdoRestMethod `
+                    -Context $Context `
+                    -Method POST `
+                    -Path "$EncodedProject/_apis/test/Runs/$($newRun.id)/results?api-version=$($script:ApiVersion)" `
+                    -Body $payloadBatch
+            }
+            catch {
+                $hasMappedRunner = @($payloadBatch | Where-Object { $_.ContainsKey('runBy') }).Count -gt 0
+                if (-not $hasMappedRunner -or -not (Test-AdoHttpStatus -ErrorRecord $_ -StatusCode 400)) {
+                    throw
+                }
+
+                foreach ($payload in $payloadBatch) {
+                    $payload.Remove('runBy')
+                }
+                Set-AdoRunnerMappingsApplyFailed -IdentityMappings $IdentityMappings -SourceResults $sourceBatch
+                Write-AdoLog `
+                    -Level Warning `
+                    -Message 'Mapped result runner was rejected; retrying result creation without runBy.' `
+                    -Context @{ sourceRunId = $SourceRun.id; targetRunId = $newRun.id; reason = $_.Exception.Message }
+                $createdResponse = Invoke-AdoRestMethod `
+                    -Context $Context `
+                    -Method POST `
+                    -Path "$EncodedProject/_apis/test/Runs/$($newRun.id)/results?api-version=$($script:ApiVersion)" `
+                    -Body $payloadBatch
+            }
             $createdResults = @(Get-CollectionValue -Response $createdResponse)
 
             if ($createdResults.Count -ne $sourceBatch.Count) {
@@ -2761,6 +3292,9 @@ function Import-AdoUnplannedRun {
                 $resultMap.Add([pscustomobject]@{
                         sourceResultId = $sourceBatch[$index].id
                         targetResultId = $createdResults[$index].id
+                        runByStatus    = $IdentityMappings.ResultRunBy[
+                            [string](Get-PropertyValue -Source $sourceBatch[$index] -Name 'id')
+                        ].Status
                     })
             }
         }
@@ -2820,15 +3354,49 @@ function Import-AdoPlannedRun {
         [object[]]$SourceResults,
 
         [Parameter(Mandatory)]
-        [object]$LinkResolution
+        [object]$LinkResolution,
+
+        [Parameter(Mandatory)]
+        [object]$IdentityMappings
     )
 
     $targetPointIds = @($LinkResolution.ResolvedResults | ForEach-Object TargetPointId)
-    $newRun = Invoke-AdoRestMethod `
+    $runPayload = New-RunCreatePayload `
+        -Run $SourceRun `
+        -PlanId $LinkResolution.TargetPlanId `
+        -PointIds $targetPointIds `
+        -OwnerResolution $IdentityMappings.Owner
+    try {
+        $newRun = Invoke-AdoRestMethod `
+            -Context $Context `
+            -Method POST `
+            -Path "$EncodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
+            -Body $runPayload
+    }
+    catch {
+        if (-not $runPayload.ContainsKey('owner') -or -not (Test-AdoHttpStatus -ErrorRecord $_ -StatusCode 400)) {
+            throw
+        }
+
+        $runPayload.Remove('owner')
+        $IdentityMappings.Owner.Resolved = $false
+        $IdentityMappings.Owner.Status = 'ApplyFailed'
+        $IdentityMappings.Owner.Reason = 'Azure DevOps rejected the mapped owner while creating the run; the migration identity was used instead.'
+        Write-AdoLog `
+            -Level Warning `
+            -Message 'Mapped Test Run owner was rejected; retrying without owner.' `
+            -Context @{ sourceRunId = $SourceRun.id; reason = $_.Exception.Message }
+        $newRun = Invoke-AdoRestMethod `
+            -Context $Context `
+            -Method POST `
+            -Path "$EncodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
+            -Body $runPayload
+    }
+    Confirm-AdoRunOwnerMapping `
         -Context $Context `
-        -Method POST `
-        -Path "$EncodedProject/_apis/test/runs?api-version=$($script:ApiVersion)" `
-        -Body (New-RunCreatePayload -Run $SourceRun -PlanId $LinkResolution.TargetPlanId -PointIds $targetPointIds)
+        -EncodedProject $EncodedProject `
+        -TargetRun $newRun `
+        -OwnerResolution $IdentityMappings.Owner
 
     try {
         $generatedResults = @(Wait-AdoRunResults `
@@ -2888,7 +3456,8 @@ function Import-AdoPlannedRun {
             (New-ResultUpdatePayload `
                 -Result $sourceResult `
                 -TargetResultId $targetResultId `
-                -AssociatedBugIds $resolvedResult.TargetAssociatedBugIds)
+                -AssociatedBugIds $resolvedResult.TargetAssociatedBugIds `
+                -RunByResolution $IdentityMappings.ResultRunBy["$($resolvedResult.SourceResultId)"])
         )
         $resultMap.Add([pscustomobject]@{
                 sourceResultId       = $resolvedResult.SourceResultId
@@ -2897,6 +3466,7 @@ function Import-AdoPlannedRun {
                 targetSuiteId        = $resolvedResult.TargetSuiteId
                 targetTestCaseId     = $resolvedResult.TargetTestCaseId
                 targetAssociatedBugs = $resolvedResult.TargetAssociatedBugIds
+                runByStatus          = $IdentityMappings.ResultRunBy["$($resolvedResult.SourceResultId)"].Status
             })
     }
 
@@ -2904,11 +3474,41 @@ function Import-AdoPlannedRun {
     for ($offset = 0; $offset -lt $updatePayloadArray.Count; $offset += 200) {
         $lastIndex = [Math]::Min($offset + 199, $updatePayloadArray.Count - 1)
         $payloadBatch = @($updatePayloadArray[$offset..$lastIndex])
-        $null = Invoke-AdoRestMethod `
-            -Context $Context `
-            -Method PATCH `
-            -Path "$EncodedProject/_apis/test/Runs/$($newRun.id)/results?api-version=$($script:ApiVersion)" `
-            -Body $payloadBatch
+        try {
+            $null = Invoke-AdoRestMethod `
+                -Context $Context `
+                -Method PATCH `
+                -Path "$EncodedProject/_apis/test/Runs/$($newRun.id)/results?api-version=$($script:ApiVersion)" `
+                -Body $payloadBatch
+        }
+        catch {
+            $hasMappedRunner = @($payloadBatch | Where-Object { $_.ContainsKey('runBy') }).Count -gt 0
+            if (-not $hasMappedRunner -or -not (Test-AdoHttpStatus -ErrorRecord $_ -StatusCode 400)) {
+                throw
+            }
+
+            foreach ($payload in $payloadBatch) {
+                $payload.Remove('runBy')
+            }
+            $batchSourceResultIds = @($resultMap[$offset..$lastIndex] | ForEach-Object sourceResultId)
+            $batchSourceResults = @($SourceResults | Where-Object {
+                    (Get-PropertyValue -Source $_ -Name 'id') -in $batchSourceResultIds
+                })
+            Set-AdoRunnerMappingsApplyFailed -IdentityMappings $IdentityMappings -SourceResults $batchSourceResults
+            Sync-AdoResultMapRunByStatuses `
+                -ResultMap $resultMap.ToArray() `
+                -IdentityMappings $IdentityMappings `
+                -SourceResultIds $batchSourceResultIds
+            Write-AdoLog `
+                -Level Warning `
+                -Message 'Mapped result runner was rejected; retrying result update without runBy.' `
+                -Context @{ sourceRunId = $SourceRun.id; targetRunId = $newRun.id; reason = $_.Exception.Message }
+            $null = Invoke-AdoRestMethod `
+                -Context $Context `
+                -Method PATCH `
+                -Path "$EncodedProject/_apis/test/Runs/$($newRun.id)/results?api-version=$($script:ApiVersion)" `
+                -Body $payloadBatch
+        }
     }
 
     $runAttachmentDirectory = Join-Path $RunPath 'attachments\run'
@@ -2990,6 +3590,7 @@ function Import-AdoTestHistory {
     $importReportJsonPath = Join-Path $resolvedExportPath "import-report-$reportTimestamp.json"
     $importReportCsvPath = Join-Path $resolvedExportPath "import-report-$reportTimestamp.csv"
     $targetPointCache = @{}
+    $identityCache = @{}
     $linkFallbackReason = $null
     $reflectedIndex = $null
 
@@ -3040,6 +3641,10 @@ function Import-AdoTestHistory {
                         failedRunCount         = 0
                         unresolvedLinkRunCount = $manifest.runCount
                         notAttemptedRunCount   = 0
+                        mappedOwnerRunCount    = 0
+                        unresolvedOwnerRunCount = 0
+                        mappedRunnerCount      = 0
+                        unresolvedRunnerCount  = 0
                     } `
                     -JsonPath $importReportJsonPath `
                     -CsvPath $importReportCsvPath
@@ -3068,6 +3673,21 @@ function Import-AdoTestHistory {
         $unresolvedReferences = @()
         $unresolvedReferenceCount = 0
         $reportReason = $null
+        $identityMappings = [pscustomobject]@{
+            Owner = [pscustomobject]@{
+                SourceAvailable     = $false
+                SourceDisplayName   = $null
+                SourcePrincipalName = $null
+                Resolved            = $false
+                Status              = 'NotEvaluated'
+                TargetId            = $null
+                TargetDisplayName   = $null
+                Reason              = $null
+            }
+            ResultRunBy           = @{}
+            MappedRunnerCount     = 0
+            UnresolvedRunnerCount = 0
+        }
 
         try {
             $runPath = Join-Path $resolvedExportPath ($manifestRun.path -replace '/', [IO.Path]::DirectorySeparatorChar)
@@ -3082,6 +3702,11 @@ function Import-AdoTestHistory {
                 -ErrorAction Stop |
                 ConvertFrom-Json
             $sourceResults = @($resultDocument.value)
+            $identityMappings = Resolve-AdoRunIdentityMappings `
+                -Context $Context `
+                -SourceRun $sourceRun `
+                -SourceResults $sourceResults `
+                -Cache $identityCache
 
             $importOutcome = $null
             if ($LinkMode -eq 'Disabled') {
@@ -3090,7 +3715,8 @@ function Import-AdoTestHistory {
                     -EncodedProject $encodedProject `
                     -RunPath $runPath `
                     -SourceRun $sourceRun `
-                    -SourceResults $sourceResults
+                    -SourceResults $sourceResults `
+                    -IdentityMappings $identityMappings
             }
             elseif (-not [string]::IsNullOrWhiteSpace($linkFallbackReason)) {
                 $linkStatus = 'UnplannedFallback'
@@ -3100,7 +3726,8 @@ function Import-AdoTestHistory {
                     -EncodedProject $encodedProject `
                     -RunPath $runPath `
                     -SourceRun $sourceRun `
-                    -SourceResults $sourceResults
+                    -SourceResults $sourceResults `
+                    -IdentityMappings $identityMappings
             }
             else {
                 $linkResolution = Resolve-AdoPlannedRunLinks `
@@ -3125,7 +3752,8 @@ function Import-AdoTestHistory {
                         -RunPath $runPath `
                         -SourceRun $sourceRun `
                         -SourceResults $sourceResults `
-                        -LinkResolution $linkResolution
+                        -LinkResolution $linkResolution `
+                        -IdentityMappings $identityMappings
                     $targetPointIds = @($importOutcome.TargetPointIds)
                 }
                 elseif ($LinkMode -eq 'Prefer') {
@@ -3135,7 +3763,8 @@ function Import-AdoTestHistory {
                         -EncodedProject $encodedProject `
                         -RunPath $runPath `
                         -SourceRun $sourceRun `
-                        -SourceResults $sourceResults
+                        -SourceResults $sourceResults `
+                        -IdentityMappings $identityMappings
                 }
                 else {
                     $linkStatus = 'UnresolvedLinks'
@@ -3149,6 +3778,12 @@ function Import-AdoTestHistory {
                             targetPointIds           = $targetPointIds
                             unresolvedReferenceCount = $unresolvedReferenceCount
                             unresolvedReferences     = $unresolvedReferences
+                            ownerMappingStatus       = $identityMappings.Owner.Status
+                            ownerMappingReason       = $identityMappings.Owner.Reason
+                            sourceOwner              = (Get-AdoIdentityResolutionLabel -Resolution $identityMappings.Owner)
+                            targetOwnerId            = $identityMappings.Owner.TargetId
+                            mappedRunnerCount        = $identityMappings.MappedRunnerCount
+                            unresolvedRunnerCount    = $identityMappings.UnresolvedRunnerCount
                             reason                   = $reportReason
                             results                  = @()
                         })
@@ -3165,6 +3800,12 @@ function Import-AdoTestHistory {
                             -TargetPlanId $targetPlanId `
                             -TargetSuiteIds $targetSuiteIds `
                             -UnresolvedReferenceCount $unresolvedReferenceCount `
+                            -OwnerMappingStatus $identityMappings.Owner.Status `
+                            -OwnerMappingReason $identityMappings.Owner.Reason `
+                            -SourceOwner (Get-AdoIdentityResolutionLabel -Resolution $identityMappings.Owner) `
+                            -TargetOwnerId $identityMappings.Owner.TargetId `
+                            -MappedRunnerCount $identityMappings.MappedRunnerCount `
+                            -UnresolvedRunnerCount $identityMappings.UnresolvedRunnerCount `
                             -Reason $reportReason)
                     )
                     Write-AdoLog `
@@ -3192,6 +3833,12 @@ function Import-AdoTestHistory {
                     targetPointIds           = $targetPointIds
                     unresolvedReferenceCount = $unresolvedReferenceCount
                     unresolvedReferences     = $unresolvedReferences
+                    ownerMappingStatus       = $identityMappings.Owner.Status
+                    ownerMappingReason       = $identityMappings.Owner.Reason
+                    sourceOwner              = (Get-AdoIdentityResolutionLabel -Resolution $identityMappings.Owner)
+                    targetOwnerId            = $identityMappings.Owner.TargetId
+                    mappedRunnerCount        = $identityMappings.MappedRunnerCount
+                    unresolvedRunnerCount    = $identityMappings.UnresolvedRunnerCount
                     reason                   = $reportReason
                     results                  = $importOutcome.ResultMap
                 })
@@ -3208,6 +3855,12 @@ function Import-AdoTestHistory {
                     -TargetPlanId $targetPlanId `
                     -TargetSuiteIds $targetSuiteIds `
                     -UnresolvedReferenceCount $unresolvedReferenceCount `
+                    -OwnerMappingStatus $identityMappings.Owner.Status `
+                    -OwnerMappingReason $identityMappings.Owner.Reason `
+                    -SourceOwner (Get-AdoIdentityResolutionLabel -Resolution $identityMappings.Owner) `
+                    -TargetOwnerId $identityMappings.Owner.TargetId `
+                    -MappedRunnerCount $identityMappings.MappedRunnerCount `
+                    -UnresolvedRunnerCount $identityMappings.UnresolvedRunnerCount `
                     -Reason $reportReason)
             )
             Write-AdoLog `
@@ -3219,6 +3872,9 @@ function Import-AdoTestHistory {
                     linkMode                 = $LinkMode
                     linkStatus               = $linkStatus
                     targetPlanId             = $targetPlanId
+                    ownerMappingStatus       = $identityMappings.Owner.Status
+                    mappedRunnerCount        = $identityMappings.MappedRunnerCount
+                    unresolvedRunnerCount    = $identityMappings.UnresolvedRunnerCount
                     unresolvedReferenceCount = $unresolvedReferenceCount
                 }
         }
@@ -3244,6 +3900,12 @@ function Import-AdoTestHistory {
                     -TargetPlanId $targetPlanId `
                     -TargetSuiteIds $targetSuiteIds `
                     -UnresolvedReferenceCount $(if ($unresolvedReferenceCount -gt 0) { $unresolvedReferenceCount } else { $null }) `
+                    -OwnerMappingStatus $identityMappings.Owner.Status `
+                    -OwnerMappingReason $identityMappings.Owner.Reason `
+                    -SourceOwner (Get-AdoIdentityResolutionLabel -Resolution $identityMappings.Owner) `
+                    -TargetOwnerId $identityMappings.Owner.TargetId `
+                    -MappedRunnerCount $identityMappings.MappedRunnerCount `
+                    -UnresolvedRunnerCount $identityMappings.UnresolvedRunnerCount `
                     -Reason $_.Exception.Message)
             )
 
@@ -3273,6 +3935,12 @@ function Import-AdoTestHistory {
                     failedRunCount         = @($reportEntries | Where-Object status -Like 'Failed*').Count
                     unresolvedLinkRunCount = @($reportEntries | Where-Object status -eq 'UnresolvedLinks').Count
                     notAttemptedRunCount   = @($reportEntries | Where-Object status -eq 'NotAttempted').Count
+                    mappedOwnerRunCount    = @($reportEntries | Where-Object ownerMappingStatus -eq 'Mapped').Count
+                    unresolvedOwnerRunCount = @($reportEntries | Where-Object {
+                            $_.ownerMappingStatus -and $_.ownerMappingStatus -notin @('Mapped', 'NotAvailable', 'NotEvaluated')
+                        }).Count
+                    mappedRunnerCount      = (@($reportEntries | Measure-Object mappedRunnerCount -Sum).Sum)
+                    unresolvedRunnerCount  = (@($reportEntries | Measure-Object unresolvedRunnerCount -Sum).Sum)
                 } `
                 -JsonPath $importReportJsonPath `
                 -CsvPath $importReportCsvPath
@@ -3291,6 +3959,12 @@ function Import-AdoTestHistory {
             failedRunCount         = @($reportEntries | Where-Object status -Like 'Failed*').Count
             unresolvedLinkRunCount = @($reportEntries | Where-Object status -eq 'UnresolvedLinks').Count
             notAttemptedRunCount   = @($reportEntries | Where-Object status -eq 'NotAttempted').Count
+            mappedOwnerRunCount    = @($reportEntries | Where-Object ownerMappingStatus -eq 'Mapped').Count
+            unresolvedOwnerRunCount = @($reportEntries | Where-Object {
+                    $_.ownerMappingStatus -and $_.ownerMappingStatus -notin @('Mapped', 'NotAvailable', 'NotEvaluated')
+                }).Count
+            mappedRunnerCount      = (@($reportEntries | Measure-Object mappedRunnerCount -Sum).Sum)
+            unresolvedRunnerCount  = (@($reportEntries | Measure-Object unresolvedRunnerCount -Sum).Sum)
         } `
         -JsonPath $importReportJsonPath `
         -CsvPath $importReportCsvPath

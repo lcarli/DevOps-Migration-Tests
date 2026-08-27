@@ -31,7 +31,9 @@ function New-InteractiveContext {
         [ValidateSet('Read', 'Write')]
         [string]$AccessLevel,
 
-        [switch]$RequireWorkItemRead
+        [switch]$RequireWorkItemRead,
+
+        [switch]$RequireIdentityRead
     )
 
     Write-Host ''
@@ -60,6 +62,9 @@ function New-InteractiveContext {
         }
         if ($RequireWorkItemRead) {
             Write-Host 'Planned run linking also requires Work Items Read access.' -ForegroundColor DarkGray
+        }
+        if ($RequireIdentityRead) {
+            Write-Host 'Preserving Test Run owners and result runners also requires Identity Read access.' -ForegroundColor DarkGray
         }
         $contextParameters.Pat = Read-Host 'PAT (it will not be saved)' -AsSecureString
     }
@@ -144,7 +149,10 @@ function Invoke-ImportMenu {
         }
     }
 
-    $context = New-InteractiveContext -AccessLevel Write -RequireWorkItemRead:($linkMode -ne 'Disabled')
+    $context = New-InteractiveContext `
+        -AccessLevel Write `
+        -RequireWorkItemRead:($linkMode -ne 'Disabled') `
+        -RequireIdentityRead
     $exportPath = Read-RequiredValue 'Export directory containing manifest.json'
 
     $confirmation = Read-Host "Type IMPORT to confirm data creation in '$($context.Project)'"

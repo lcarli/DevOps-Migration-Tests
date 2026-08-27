@@ -17,6 +17,9 @@ Azure DevOps project and recreates them in another project or organization.
 - Exporting with an Area Path filter requires `Work Items: Read`.
 - Importing with planned run linking (`Prefer` or `Require`) also requires
   `Work Items: Read`.
+- Importing preserves Test Run owners and result runners when matching active
+  identities exist in the target organization. PAT authentication therefore
+  also requires `Identity: Read`.
 
 ## Usage
 
@@ -74,8 +77,24 @@ separately counts results without a Test Case link and results linked to Test
 Cases outside the selected Area Path. Import statuses include `Imported`,
 `UnresolvedLinks`, `Failed`, `FailedPartial`, and `NotAttempted`. Import
 reports also add `linkMode`, `linkStatus`, `targetPlanId`, `targetSuiteIds`,
-and `unresolvedReferenceCount`. `linkStatus` distinguishes
+`unresolvedReferenceCount`, `ownerMappingStatus`, `sourceOwner`,
+`targetOwnerId`, `mappedRunnerCount`, and `unresolvedRunnerCount`.
+`linkStatus` distinguishes
 `PlannedLinked`, `UnplannedFallback`, `Disabled`, and `UnresolvedLinks`.
+
+## Identity preservation
+
+During import, the utility uses the source identity account or email address to
+find an exact active match in the target Azure DevOps organization. When found,
+the target identity ID is applied to the Test Run `owner` and Test Result
+`runBy` fields.
+
+Identity mapping is best-effort and never blocks the history migration. When an
+identity is missing, ambiguous, or cannot be queried, the original display name
+and account are retained in the run or result comment. The import report records
+the mapping status and reason. Azure DevOps audit fields such as the actor who
+created the target artifact remain assigned to the account executing the
+migration and cannot be rewritten through the Test APIs.
 
 ## Export contents
 
