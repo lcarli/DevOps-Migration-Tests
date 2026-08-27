@@ -125,6 +125,13 @@ result ID, Test Case, Test Point, Test Plan, Test Suite, Configuration, and
 associated Bug IDs when they are available. Metadata lookup failures are
 captured in the file and the export continues.
 
+Attachments are exported at the Test Run, Test Result, and manual test
+iteration/step levels. Manual step attachments retain their source
+`iterationId` and `actionPath`. Import first attempts to restore the original
+step association through the Azure DevOps preview API; if that association is
+not supported by the target result, the file is retained as a result-level
+attachment and the fallback is written to the diagnostic log.
+
 ## Planned run linking
 
 Planned linking relies on a reflected source ID field in the target project for
@@ -169,8 +176,9 @@ Safe fallback behavior:
 - Operational dates can be submitted, but audit dates and identities are set by
   Azure DevOps when the resources are recreated.
 - Analytics history is not rebuilt retroactively.
-- Run and result attachments are included. Attachments associated exclusively
-  with subresults are not included in this version.
+- Run, result, and manual iteration/step attachments are included. Attachments
+  associated exclusively with automated test subresults are not included in
+  this version.
 
 Run a proof of concept in a disposable target project before a production
 migration.

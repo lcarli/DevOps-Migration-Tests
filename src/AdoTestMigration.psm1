@@ -267,7 +267,11 @@ function Invoke-AdoRestMethod {
         [object]$Body
     )
 
-    $uri = "$($Context.OrganizationUrl)/$Path"
+    $uri = if ($Path -match '^https://') {
+        $Path
+    } else {
+        "$($Context.OrganizationUrl)/$Path"
+    }
     $parameters = @{
         Uri         = $uri
         Method      = $Method
@@ -596,13 +600,19 @@ function Save-AdoBinary {
         [string]$Destination
     )
 
+    $uri = if ($Path -match '^https://') {
+        $Path
+    } else {
+        "$($Context.OrganizationUrl)/$Path"
+    }
+
     try {
         Write-AdoLog `
             -Level Debug `
             -Message 'Attachment download started.' `
-            -Context @{ uri = "$($Context.OrganizationUrl)/$Path"; destination = $Destination }
+            -Context @{ uri = $uri; destination = $Destination }
         Invoke-WebRequest `
-            -Uri "$($Context.OrganizationUrl)/$Path" `
+            -Uri $uri `
             -Headers $Context.Headers `
             -OutFile $Destination `
             -ErrorAction Stop | Out-Null
@@ -615,7 +625,7 @@ function Save-AdoBinary {
         $exception = New-AdoRestException `
             -ErrorRecord $_ `
             -Method GET `
-            -Uri "$($Context.OrganizationUrl)/$Path"
+            -Uri $uri
         Write-AdoLog `
             -Level Error `
             -Message 'Attachment download failed.' `
@@ -702,6 +712,9 @@ function Save-AdoRunReport {
         'processedResultCount',
         'unlinkedResultCount',
         'outsideAreaResultCount',
+        'runAttachmentCount',
+        'resultAttachmentCount',
+        'iterationAttachmentCount',
         'linkMode',
         'linkStatus',
         'targetPlanId',
@@ -1057,6 +1070,8 @@ function Export-AdoAttachments {
     )
 
     $encodedProject = [uri]::EscapeDataString($Context.Project)
+    $resultAttachmentCount = 0
+    $iterationAttachmentCount = 0
     $runAttachmentPath = Join-Path $RunPath 'attachments\run'
     $runAttachmentResponse = Invoke-AdoRestMethod `
         -Context $Context `
@@ -1082,22 +1097,114 @@ function Export-AdoAttachments {
             -Method GET `
             -Path "$encodedProject/_apis/test/Runs/$RunId/Results/$($result.id)/attachments?api-version=$($script:ApiVersion)"
         $resultAttachments = @(Get-CollectionValue -Response $resultAttachmentResponse)
+        $resultAttachmentCount += $resultAttachments.Count
 
-        if ($resultAttachments.Count -eq 0) {
-            continue
+        if ($resultAttachments.Count -gt 0) {
+            $resultAttachmentPath = Join-Path $RunPath "attachments\results\$($result.id)"
+            New-Item -ItemType Directory -Path $resultAttachmentPath -Force | Out-Null
+            Save-JsonFile -Value $resultAttachments -Path (Join-Path $resultAttachmentPath 'metadata.json')
+
+            foreach ($attachment in $resultAttachments) {
+                $fileName = "$(('{0:D8}' -f [int]$attachment.id))_$(Get-SafeFileName -Name $attachment.fileName)"
+                Save-AdoBinary `
+                    -Context $Context `
+                    -Path "$encodedProject/_apis/test/Runs/$RunId/Results/$($result.id)/attachments/$($attachment.id)?api-version=$($script:ApiVersion)" `
+                    -Destination (Join-Path $resultAttachmentPath $fileName)
+            }
         }
 
-        $resultAttachmentPath = Join-Path $RunPath "attachments\results\$($result.id)"
-        New-Item -ItemType Directory -Path $resultAttachmentPath -Force | Out-Null
-        Save-JsonFile -Value $resultAttachments -Path (Join-Path $resultAttachmentPath 'metadata.json')
-
-        foreach ($attachment in $resultAttachments) {
-            $fileName = "$(('{0:D8}' -f [int]$attachment.id))_$(Get-SafeFileName -Name $attachment.fileName)"
-            Save-AdoBinary `
-                -Context $Context `
-                -Path "$encodedProject/_apis/test/Runs/$RunId/Results/$($result.id)/attachments/$($attachment.id)?api-version=$($script:ApiVersion)" `
-                -Destination (Join-Path $resultAttachmentPath $fileName)
+        $resultWithIterations = Invoke-AdoRestMethod `
+            -Context $Context `
+            -Method GET `
+            -Path "$encodedProject/_apis/test/Runs/$RunId/results/$($result.id)?detailsToInclude=Iterations&api-version=$($script:ApiVersion)"
+        $iterationAttachments = [Collections.Generic.List[object]]::new()
+        foreach ($iteration in @(Get-PropertyValue -Source $resultWithIterations -Name 'iterationDetails' -DefaultValue @())) {
+            $iterationId = Get-PropertyValue -Source $iteration -Name 'id'
+            foreach ($attachment in @(Get-PropertyValue -Source $iteration -Name 'attachments' -DefaultValue @())) {
+                $attachmentId = Get-PropertyValue -Source $attachment -Name 'id'
+                $attachmentName = [string](Get-PropertyValue -Source $attachment -Name 'name')
+                if ([string]::IsNullOrWhiteSpace($attachmentName)) {
+                    $attachmentName = [string](Get-PropertyValue -Source $attachment -Name 'fileName')
+                }
+                $iterationAttachments.Add([pscustomobject]@{
+                        id             = $attachmentId
+                        fileName       = $attachmentName
+                        comment        = Get-PropertyValue -Source $attachment -Name 'comment'
+                        attachmentType = Get-PropertyValue -Source $attachment -Name 'attachmentType' -DefaultValue 'GeneralAttachment'
+                        iterationId    = Get-PropertyValue -Source $attachment -Name 'iterationId' -DefaultValue $iterationId
+                        actionPath     = Get-PropertyValue -Source $attachment -Name 'actionPath'
+                        url            = Get-PropertyValue -Source $attachment -Name 'url'
+                    })
+            }
         }
+
+        if ($iterationAttachments.Count -gt 0) {
+            $iterationAttachmentCountBeforeResult = $iterationAttachmentCount
+            $iterationAttachmentPath = Join-Path $RunPath "attachments\iterations\$($result.id)"
+            New-Item -ItemType Directory -Path $iterationAttachmentPath -Force | Out-Null
+            Save-JsonFile `
+                -Value $iterationAttachments.ToArray() `
+                -Path (Join-Path $iterationAttachmentPath 'metadata.json')
+
+            foreach ($attachment in $iterationAttachments) {
+                if ([string]::IsNullOrWhiteSpace([string]$attachment.url)) {
+                    Write-AdoLog `
+                        -Level Warning `
+                        -Message 'Manual test step attachment did not include a download URL.' `
+                        -Context @{
+                            runId       = $RunId
+                            resultId    = $result.id
+                            attachmentId = $attachment.id
+                            iterationId = $attachment.iterationId
+                            actionPath  = $attachment.actionPath
+                        }
+                    continue
+                }
+
+                $fileName = "$(('{0:D8}' -f [int]$attachment.id))_$(Get-SafeFileName -Name $attachment.fileName)"
+                $organizationName = Get-AdoOrganizationName -OrganizationUrl $Context.OrganizationUrl
+                $iterationDownloadUrl = 'https://vstmr.dev.azure.com/' +
+                    "$([uri]::EscapeDataString($organizationName))/" +
+                    "$([uri]::EscapeDataString($Context.Project))/" +
+                    "_apis/testresults/runs/$RunId/results/$($result.id)/attachments/$($attachment.id)" +
+                    "?iterationId=$($attachment.iterationId)&api-version=7.1-preview.1"
+                try {
+                    Save-AdoBinary `
+                        -Context $Context `
+                        -Path $iterationDownloadUrl `
+                        -Destination (Join-Path $iterationAttachmentPath $fileName)
+                    $iterationAttachmentCount++
+                }
+                catch {
+                    Write-AdoLog `
+                        -Level Warning `
+                        -Message 'Manual test step attachment download failed; the run export will continue.' `
+                        -Context @{
+                            runId        = $RunId
+                            resultId     = $result.id
+                            attachmentId = $attachment.id
+                            iterationId  = $attachment.iterationId
+                            actionPath   = $attachment.actionPath
+                            error        = $_.Exception.Message
+                        }
+                }
+            }
+            Write-AdoLog `
+                -Level Info `
+                -Message 'Manual test step attachments exported.' `
+                -Context @{
+                    runId           = $RunId
+                    resultId        = $result.id
+                    attachmentCount = $iterationAttachmentCount - $iterationAttachmentCountBeforeResult
+                }
+        }
+    }
+
+    return [pscustomobject]@{
+        RunAttachmentCount       = $runAttachments.Count
+        ResultAttachmentCount    = $resultAttachmentCount
+        IterationAttachmentCount = $iterationAttachmentCount
+        TotalAttachmentCount     = $runAttachments.Count + $resultAttachmentCount + $iterationAttachmentCount
     }
 }
 
@@ -1674,7 +1781,7 @@ function Export-AdoTestHistory {
                 -Level Debug `
                 -Message 'Exporting run attachments.' `
                 -Context @{ runId = $runSummary.id; phase = 'attachments' }
-            Export-AdoAttachments `
+            $attachmentSummary = Export-AdoAttachments `
                 -Context $Context `
                 -RunId $runSummary.id `
                 -RunPath $runPath `
@@ -1687,6 +1794,10 @@ function Export-AdoTestHistory {
                     linkMetadataPath = "runs/$($runSummary.id)/links.json"
                     resultCount      = $results.Count
                     sourceResultCount = $allResults.Count
+                    runAttachmentCount = $attachmentSummary.RunAttachmentCount
+                    resultAttachmentCount = $attachmentSummary.ResultAttachmentCount
+                    iterationAttachmentCount = $attachmentSummary.IterationAttachmentCount
+                    attachmentCount = $attachmentSummary.TotalAttachmentCount
                 })
             $reasonParts = [Collections.Generic.List[string]]::new()
             if ($unlinkedResultCount -gt 0 -or $outsideAreaResultCount -gt 0) {
@@ -1709,6 +1820,9 @@ function Export-AdoTestHistory {
                     processedResultCount     = $results.Count
                     unlinkedResultCount      = $unlinkedResultCount
                     outsideAreaResultCount   = $outsideAreaResultCount
+                    runAttachmentCount       = $attachmentSummary.RunAttachmentCount
+                    resultAttachmentCount    = $attachmentSummary.ResultAttachmentCount
+                    iterationAttachmentCount = $attachmentSummary.IterationAttachmentCount
                     linkMode                 = $null
                     linkStatus               = $null
                     targetPlanId             = $null
@@ -1727,6 +1841,9 @@ function Export-AdoTestHistory {
                     runId                = $runSummary.id
                     resultCount          = $results.Count
                     nonLinkableResultCount = $linkMetadata.nonLinkableResultCount
+                    runAttachmentCount   = $attachmentSummary.RunAttachmentCount
+                    resultAttachmentCount = $attachmentSummary.ResultAttachmentCount
+                    iterationAttachmentCount = $attachmentSummary.IterationAttachmentCount
                 }
         }
         catch {
@@ -2608,7 +2725,8 @@ function New-ResultCreatePayload {
             'startedDate',
             'completedDate',
             'failureType',
-            'resolutionState'
+            'resolutionState',
+            'iterationDetails'
         )) {
         Add-PropertyIfPresent -Target $payload -Source $Result -SourceName $propertyName
     }
@@ -2654,7 +2772,8 @@ function New-ResultUpdatePayload {
             'startedDate',
             'completedDate',
             'failureType',
-            'resolutionState'
+            'resolutionState',
+            'iterationDetails'
         )) {
         Add-PropertyIfPresent -Target $payload -Source $Result -SourceName $propertyName
     }
@@ -2781,6 +2900,105 @@ function Import-AttachmentDirectory {
             -Path $ApiPath `
             -FilePath $file.FullName `
             -Metadata $metadata
+    }
+}
+
+function Import-IterationAttachmentDirectory {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$Context,
+
+        [Parameter(Mandatory)]
+        [string]$Directory,
+
+        [Parameter(Mandatory)]
+        [string]$EncodedProject,
+
+        [Parameter(Mandatory)]
+        [int]$TargetRunId,
+
+        [Parameter(Mandatory)]
+        [int]$TargetResultId
+    )
+
+    $metadataPath = Join-Path $Directory 'metadata.json'
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+        return
+    }
+
+    $metadataItems = @(Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json)
+    foreach ($metadata in $metadataItems) {
+        $prefix = '{0:D8}_' -f [int]$metadata.id
+        $file = Get-ChildItem -LiteralPath $Directory -File |
+            Where-Object Name -Like "$prefix*" |
+            Select-Object -First 1
+        if (-not $file) {
+            Write-Warning "Manual test step attachment file $($metadata.id) was not found in '$Directory'."
+            continue
+        }
+
+        $iterationId = ConvertTo-IntIfPossible -Value (Get-PropertyValue -Source $metadata -Name 'iterationId')
+        $actionPath = [string](Get-PropertyValue -Source $metadata -Name 'actionPath')
+        $resultAttachmentPath = "$EncodedProject/_apis/test/Runs/$TargetRunId/Results/$TargetResultId/attachments"
+        if ($null -eq $iterationId) {
+            Write-AdoLog `
+                -Level Warning `
+                -Message 'Manual test step attachment has no iteration ID; importing at result level.' `
+                -Context @{ targetRunId = $TargetRunId; targetResultId = $TargetResultId; attachmentId = $metadata.id }
+            Add-AdoAttachment `
+                -Context $Context `
+                -Path "${resultAttachmentPath}?api-version=$($script:ApiVersion)" `
+                -FilePath $file.FullName `
+                -Metadata $metadata
+            continue
+        }
+
+        $queryParts = @("iterationId=$iterationId")
+        if (-not [string]::IsNullOrWhiteSpace($actionPath)) {
+            $queryParts += "actionPath=$([uri]::EscapeDataString($actionPath))"
+        }
+        $queryParts += 'api-version=7.1-preview.1'
+        $organizationName = Get-AdoOrganizationName -OrganizationUrl $Context.OrganizationUrl
+        $stepAttachmentPath = 'https://vstmr.dev.azure.com/' +
+            "$([uri]::EscapeDataString($organizationName))/" +
+            "$EncodedProject/_apis/testresults/runs/$TargetRunId/results/$TargetResultId/attachments" +
+            "?$($queryParts -join '&')"
+
+        try {
+            Add-AdoAttachment `
+                -Context $Context `
+                -Path $stepAttachmentPath `
+                -FilePath $file.FullName `
+                -Metadata $metadata
+            Write-AdoLog `
+                -Level Info `
+                -Message 'Manual test step attachment imported.' `
+                -Context @{
+                    targetRunId    = $TargetRunId
+                    targetResultId = $TargetResultId
+                    iterationId    = $iterationId
+                    actionPath     = $actionPath
+                    fileName       = $metadata.fileName
+                }
+        }
+        catch {
+            Write-AdoLog `
+                -Level Warning `
+                -Message 'Manual test step attachment could not be associated with its original step; importing at result level.' `
+                -Context @{
+                    targetRunId    = $TargetRunId
+                    targetResultId = $TargetResultId
+                    iterationId    = $iterationId
+                    actionPath     = $actionPath
+                    fileName       = $metadata.fileName
+                    error          = $_.Exception.Message
+                }
+            Add-AdoAttachment `
+                -Context $Context `
+                -Path "${resultAttachmentPath}?api-version=$($script:ApiVersion)" `
+                -FilePath $file.FullName `
+                -Metadata $metadata
+        }
     }
 }
 
@@ -3309,14 +3527,22 @@ function Import-AdoUnplannedRun {
 
         foreach ($mappedResult in $resultMap) {
             $resultAttachmentDirectory = Join-Path $RunPath "attachments\results\$($mappedResult.sourceResultId)"
-            if (-not (Test-Path -LiteralPath $resultAttachmentDirectory -PathType Container)) {
-                continue
+            if (Test-Path -LiteralPath $resultAttachmentDirectory -PathType Container) {
+                Import-AttachmentDirectory `
+                    -Context $Context `
+                    -Directory $resultAttachmentDirectory `
+                    -ApiPath "$EncodedProject/_apis/test/Runs/$($newRun.id)/Results/$($mappedResult.targetResultId)/attachments?api-version=$($script:ApiVersion)"
             }
 
-            Import-AttachmentDirectory `
-                -Context $Context `
-                -Directory $resultAttachmentDirectory `
-                -ApiPath "$EncodedProject/_apis/test/Runs/$($newRun.id)/Results/$($mappedResult.targetResultId)/attachments?api-version=$($script:ApiVersion)"
+            $iterationAttachmentDirectory = Join-Path $RunPath "attachments\iterations\$($mappedResult.sourceResultId)"
+            if (Test-Path -LiteralPath $iterationAttachmentDirectory -PathType Container) {
+                Import-IterationAttachmentDirectory `
+                    -Context $Context `
+                    -Directory $iterationAttachmentDirectory `
+                    -EncodedProject $EncodedProject `
+                    -TargetRunId $newRun.id `
+                    -TargetResultId $mappedResult.targetResultId
+            }
         }
 
         Complete-AdoRun `
@@ -3521,14 +3747,22 @@ function Import-AdoPlannedRun {
 
     foreach ($mappedResult in $resultMap) {
         $resultAttachmentDirectory = Join-Path $RunPath "attachments\results\$($mappedResult.sourceResultId)"
-        if (-not (Test-Path -LiteralPath $resultAttachmentDirectory -PathType Container)) {
-            continue
+        if (Test-Path -LiteralPath $resultAttachmentDirectory -PathType Container) {
+            Import-AttachmentDirectory `
+                -Context $Context `
+                -Directory $resultAttachmentDirectory `
+                -ApiPath "$EncodedProject/_apis/test/Runs/$($newRun.id)/Results/$($mappedResult.targetResultId)/attachments?api-version=$($script:ApiVersion)"
         }
 
-        Import-AttachmentDirectory `
-            -Context $Context `
-            -Directory $resultAttachmentDirectory `
-            -ApiPath "$EncodedProject/_apis/test/Runs/$($newRun.id)/Results/$($mappedResult.targetResultId)/attachments?api-version=$($script:ApiVersion)"
+        $iterationAttachmentDirectory = Join-Path $RunPath "attachments\iterations\$($mappedResult.sourceResultId)"
+        if (Test-Path -LiteralPath $iterationAttachmentDirectory -PathType Container) {
+            Import-IterationAttachmentDirectory `
+                -Context $Context `
+                -Directory $iterationAttachmentDirectory `
+                -EncodedProject $EncodedProject `
+                -TargetRunId $newRun.id `
+                -TargetResultId $mappedResult.targetResultId
+        }
     }
 
     Complete-AdoRun `

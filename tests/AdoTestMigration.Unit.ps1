@@ -178,6 +178,20 @@ if (-not $module) {
     $blankOutcomePayload = New-ResultCreatePayload -Result ([pscustomobject]@{ id = 201; outcome = '' })
     Assert-Equal -Actual $blankOutcomePayload.outcome -Expected 'Unspecified' -Message 'A blank source outcome should use the Azure DevOps Unspecified outcome.'
 
+    $iterationPayload = New-ResultUpdatePayload `
+        -Result ([pscustomobject]@{
+                id               = 202
+                iterationDetails = @(
+                    [pscustomobject]@{
+                        id            = 1
+                        actionResults = @([pscustomobject]@{ actionPath = '00000002'; outcome = 'Passed' })
+                    }
+                )
+            }) `
+        -TargetResultId 302 `
+        -AssociatedBugIds @()
+    Assert-Equal -Actual $iterationPayload.iterationDetails[0].actionResults[0].actionPath -Expected '00000002' -Message 'Manual iteration and action result metadata should be recreated before step attachments are uploaded.'
+
     Assert-Equal -Actual (Get-AdoOrganizationName -OrganizationUrl 'https://dev.azure.com/contoso') -Expected 'contoso' -Message 'Organization names should be parsed from dev.azure.com URLs.'
     Assert-Equal -Actual (Get-AdoOrganizationName -OrganizationUrl 'https://contoso.visualstudio.com') -Expected 'contoso' -Message 'Organization names should be parsed from visualstudio.com URLs.'
 
@@ -259,6 +273,82 @@ if (-not $module) {
     )
     $httpErrorRecord.ErrorDetails = [System.Management.Automation.ErrorDetails]::new('{"message":"Test run was not found."}')
     Assert-Equal -Actual (Get-AdoErrorMessage -ErrorRecord $httpErrorRecord) -Expected 'Azure DevOps returned HTTP 404. Test run was not found.' -Message 'HTTP errors should retain status and service details.'
+
+    $attachmentTestPath = Join-Path $PSScriptRoot '__attachment-test__'
+    if (Test-Path -LiteralPath $attachmentTestPath) {
+        Remove-Item -LiteralPath $attachmentTestPath -Recurse -Force
+    }
+    $script:downloadedAttachmentPath = $null
+    function Invoke-AdoRestMethod {
+        param($Context, $Method, $Path, $Body)
+        if ($Path -like '*/results/401?detailsToInclude=Iterations*') {
+            return [pscustomobject]@{
+                iterationDetails = @(
+                    [pscustomobject]@{
+                        id          = 1
+                        attachments = @(
+                            [pscustomobject]@{
+                                id          = 402
+                                name        = 'screenshot.png'
+                                url         = 'https://example.test/attachment/402'
+                                iterationId = 1
+                                actionPath  = '00000001'
+                            }
+                        )
+                    }
+                )
+            }
+        }
+        return [pscustomobject]@{ value = @() }
+    }
+    function Save-AdoBinary {
+        param($Context, $Path, $Destination)
+        $script:downloadedAttachmentPath = $Path
+        Set-Content -LiteralPath $Destination -Value 'attachment' -Encoding utf8NoBOM
+    }
+
+    $attachmentSummary = Export-AdoAttachments `
+        -Context ([pscustomobject]@{ Project = 'Target'; OrganizationUrl = 'https://dev.azure.com/contoso' }) `
+        -RunId 400 `
+        -RunPath $attachmentTestPath `
+        -Results @(
+            [pscustomobject]@{
+                id = 401
+            },
+            [pscustomobject]@{
+                id = 403
+            }
+        )
+    $iterationMetadataPath = Join-Path $attachmentTestPath 'attachments\iterations\401\metadata.json'
+    Assert-True -Condition (Test-Path -LiteralPath $iterationMetadataPath -PathType Leaf) -Message 'Manual test step attachment metadata should be exported.'
+    $iterationMetadata = Get-Content -LiteralPath $iterationMetadataPath -Raw | ConvertFrom-Json
+    Assert-Equal -Actual $iterationMetadata.actionPath -Expected '00000001' -Message 'Manual test step action paths should be preserved.'
+    Assert-Equal -Actual $script:downloadedAttachmentPath -Expected 'https://vstmr.dev.azure.com/contoso/Target/_apis/testresults/runs/400/results/401/attachments/402?iterationId=1&api-version=7.1-preview.1' -Message 'Manual test step attachments should use the Test Results iteration download API.'
+    Assert-Equal -Actual $attachmentSummary.IterationAttachmentCount -Expected 1 -Message 'Attachment summaries should include successfully downloaded iteration attachments across all results.'
+    $emptyAttachmentSummary = Export-AdoAttachments `
+        -Context ([pscustomobject]@{ Project = 'Target'; OrganizationUrl = 'https://dev.azure.com/contoso' }) `
+        -RunId 404 `
+        -RunPath $attachmentTestPath `
+        -Results ([object[]]@())
+    Assert-Equal -Actual $emptyAttachmentSummary.TotalAttachmentCount -Expected 0 -Message 'Runs without results should still return an empty attachment summary.'
+
+    $script:attachmentUploadPaths = [Collections.Generic.List[string]]::new()
+    function Add-AdoAttachment {
+        param($Context, $Path, $FilePath, $Metadata)
+        $script:attachmentUploadPaths.Add($Path)
+        if ($Path -like '*iterationId=*') {
+            throw 'Simulated unsupported step attachment API.'
+        }
+    }
+    Import-IterationAttachmentDirectory `
+        -Context ([pscustomobject]@{ OrganizationUrl = 'https://dev.azure.com/contoso' }) `
+        -Directory (Join-Path $attachmentTestPath 'attachments\iterations\401') `
+        -EncodedProject 'Target' `
+        -TargetRunId 500 `
+        -TargetResultId 501
+    Assert-Equal -Actual $script:attachmentUploadPaths[0] -Expected 'https://vstmr.dev.azure.com/contoso/Target/_apis/testresults/runs/500/results/501/attachments?iterationId=1&actionPath=00000001&api-version=7.1-preview.1' -Message 'Manual test step attachments should first use the Test Results iteration API.'
+    Assert-Equal -Actual $script:attachmentUploadPaths[1] -Expected 'Target/_apis/test/Runs/500/Results/501/attachments?api-version=7.1' -Message 'Unsupported step associations should fall back to a result-level attachment.'
+    Remove-Item -LiteralPath $attachmentTestPath -Recurse -Force
 
     $script:capturedResultPath = $null
     function Invoke-AdoRestMethod {
